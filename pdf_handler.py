@@ -1,6 +1,12 @@
+"""
+PDF handler — loads PDFs, embeds them with sentence-transformers, stores
+chunks in ChromaDB, and exposes semantic search via query_pdfs().
+"""
 import os
 import re
-from config import PDF_DIR
+
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 try:
     import PyPDF2
@@ -8,55 +14,55 @@ try:
 except ImportError:
     HAS_PYPDF2 = False
 
-try:
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
-    import numpy as np
-    HAS_SKLEARN = True
-except ImportError:
-    HAS_SKLEARN = False
+from config import PDF_DIR, CHROMA_DIR
 
-_all_chunks: list[str] = []
-_chunk_sources: list[str] = []
+COLLECTION_NAME = "pdf_library"
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"   # 80 MB, fast, good quality
+
+_embed_model: SentenceTransformer | None = None
+_chroma_client: chromadb.PersistentClient | None = None
+_collection = None
 
 
-def load_pdfs():
-    global _all_chunks, _chunk_sources
-    _all_chunks = []
-    _chunk_sources = []
+# ── internal helpers ──────────────────────────────────────────────────────────
 
-    if not os.path.exists(PDF_DIR):
-        os.makedirs(PDF_DIR, exist_ok=True)
-        return
+def _embed_model_instance() -> SentenceTransformer:
+    global _embed_model
+    if _embed_model is None:
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return _embed_model
 
-    for filename in sorted(os.listdir(PDF_DIR)):
-        if not filename.lower().endswith(".pdf"):
-            continue
-        filepath = os.path.join(PDF_DIR, filename)
-        text = _extract_text(filepath)
-        if text:
-            for chunk in _chunk_text(text):
-                _all_chunks.append(chunk)
-                _chunk_sources.append(filename)
+
+def _get_collection():
+    global _chroma_client, _collection
+    if _chroma_client is None:
+        os.makedirs(CHROMA_DIR, exist_ok=True)
+        _chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+    if _collection is None:
+        _collection = _chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"},
+        )
+    return _collection
 
 
 def _extract_text(filepath: str) -> str:
     if not HAS_PYPDF2:
         return ""
     try:
-        text_parts = []
+        parts: list[str] = []
         with open(filepath, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
-                part = page.extract_text()
-                if part:
-                    text_parts.append(part)
-        return "\n".join(text_parts)
+                t = page.extract_text()
+                if t:
+                    parts.append(t)
+        return "\n".join(parts)
     except Exception:
         return ""
 
 
-def _chunk_text(text: str, chunk_size: int = 600, overlap: int = 100) -> list[str]:
+def _chunk_text(text: str, chunk_size: int = 600) -> list[str]:
     sentences = re.split(r"(?<=[.!?])\s+", text)
     chunks: list[str] = []
     current = ""
@@ -72,45 +78,80 @@ def _chunk_text(text: str, chunk_size: int = 600, overlap: int = 100) -> list[st
     return [c for c in chunks if len(c) > 40]
 
 
-def answer_from_pdfs(question: str) -> str:
-    if not _all_chunks:
-        load_pdfs()
+# ── public API ────────────────────────────────────────────────────────────────
 
-    if not _all_chunks:
-        return (
-            "No PDF documents are loaded in the library yet. "
-            "Please add PDF files to the `pdfs/` directory and ask an admin to reload."
-        )
+def load_pdfs() -> int:
+    """
+    (Re-)index all PDFs in PDF_DIR into ChromaDB.
+    Drops the existing collection first so stale chunks are removed.
+    Returns the number of chunks embedded.
+    """
+    global _collection
 
-    if HAS_SKLEARN:
-        return _tfidf_answer(question)
-    return _keyword_answer(question)
+    os.makedirs(PDF_DIR, exist_ok=True)
 
-
-def _tfidf_answer(question: str) -> str:
+    # Drop and recreate so reloads are idempotent
+    client = _chroma_client or chromadb.PersistentClient(path=CHROMA_DIR)
     try:
-        corpus = _all_chunks + [question]
-        vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
-        matrix = vectorizer.fit_transform(corpus)
-        sims = cosine_similarity(matrix[-1], matrix[:-1])[0]
-        best = int(np.argmax(sims))
-        if sims[best] < 0.08:
-            return "I could not find a relevant answer in the PDF library for your question."
-        return f"**Source: {_chunk_sources[best]}**\n\n{_all_chunks[best]}"
+        client.delete_collection(COLLECTION_NAME)
     except Exception:
-        return _keyword_answer(question)
+        pass
+    _collection = None
+
+    collection = _get_collection()
+    pdf_files = [f for f in os.listdir(PDF_DIR) if f.lower().endswith(".pdf")]
+    if not pdf_files:
+        return 0
+
+    model = _embed_model_instance()
+    all_ids, all_docs, all_metas = [], [], []
+
+    for filename in sorted(pdf_files):
+        text = _extract_text(os.path.join(PDF_DIR, filename))
+        if not text:
+            continue
+        for i, chunk in enumerate(_chunk_text(text)):
+            all_ids.append(f"{filename}__chunk_{i}")
+            all_docs.append(chunk)
+            all_metas.append({"source": filename, "chunk_idx": i})
+
+    if not all_docs:
+        return 0
+
+    # Embed in batches so large libraries don't OOM
+    batch_size = 64
+    for i in range(0, len(all_docs), batch_size):
+        b_ids   = all_ids[i : i + batch_size]
+        b_docs  = all_docs[i : i + batch_size]
+        b_metas = all_metas[i : i + batch_size]
+        embeddings = model.encode(b_docs, show_progress_bar=False).tolist()
+        collection.upsert(ids=b_ids, documents=b_docs, metadatas=b_metas, embeddings=embeddings)
+
+    return len(all_docs)
 
 
-def _keyword_answer(question: str) -> str:
-    keywords = set(re.sub(r"[^\w\s]", "", question.lower()).split())
-    best_score, best_chunk, best_source = 0, None, None
-    for chunk, source in zip(_all_chunks, _chunk_sources):
-        score = len(keywords & set(chunk.lower().split()))
-        if score > best_score:
-            best_score, best_chunk, best_source = score, chunk, source
-    if best_chunk:
-        return f"**Source: {best_source}**\n\n{best_chunk}"
-    return "I could not find a relevant answer in the PDF library for your question."
+def query_pdfs(question: str, top_k: int = 3) -> list[dict]:
+    """
+    Semantic search over embedded PDF chunks.
+    Returns a list of dicts: {text, source, score}.
+    Score is cosine similarity (higher = more relevant).
+    """
+    collection = _get_collection()
+    if collection.count() == 0:
+        return []
+
+    model = _embed_model_instance()
+    q_emb = model.encode([question], show_progress_bar=False).tolist()
+    n = min(top_k, collection.count())
+
+    results = collection.query(query_embeddings=q_emb, n_results=n)
+    chunks: list[dict] = []
+    for doc, meta, dist in zip(
+        results["documents"][0], results["metadatas"][0], results["distances"][0]
+    ):
+        chunks.append({"text": doc, "source": meta["source"], "score": round(1.0 - dist, 4)})
+
+    return chunks
 
 
 def get_pdf_list() -> list[str]:
