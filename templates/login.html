@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Login – ChatBot{% endblock %}
+
+{% block content %}
+<div class="login-wrapper">
+  <div class="login-card">
+    <div class="login-logo">
+      <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="20" cy="20" r="20" fill="#4f46e5"/>
+        <path d="M12 26c0-4.418 3.582-8 8-8s8 3.582 8 8" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+        <circle cx="20" cy="14" r="4" fill="#fff"/>
+      </svg>
+    </div>
+    <h1>Company ChatBot</h1>
+    <p class="login-subtitle">Sign in to continue</p>
+
+    {% if error %}
+    <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('login') }}">
+      <div class="form-group">
+        <label for="username">Username</label>
+        <input
+          id="username"
+          name="username"
+          type="text"
+          placeholder="Enter your username"
+          autocomplete="username"
+          required
+        />
+      </div>
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          placeholder="Enter your password"
+          autocomplete="current-password"
+          required
+        />
+      </div>
+      <button type="submit" class="btn btn-primary btn-full">Sign In</button>
+    </form>
+
+    <p class="login-hint">
+      Demo accounts: <code>admin / admin123</code> &nbsp;|&nbsp;
+      <code>john.doe / password123</code>
+    </p>
+  </div>
+</div>
+{% endblock %}
