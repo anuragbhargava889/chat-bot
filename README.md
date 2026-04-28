@@ -1,6 +1,6 @@
 # Company ChatBot
 
-A Python web chatbot that integrates **MySQL product-sales queries**, a **PDF knowledge library**, and **employee attendance tracking** — all through a single chat interface.
+A Python web chatbot powered by **Claude AI** that intelligently routes queries across multiple data sources — MySQL databases, a ChromaDB vector store, and a PDF knowledge library — through a single natural-language chat interface.
 
 ---
 
@@ -8,10 +8,11 @@ A Python web chatbot that integrates **MySQL product-sales queries**, a **PDF kn
 
 | Feature | Description |
 |---|---|
-| **Product Sales** | Ask about monthly sales for any product; data is pulled live from MySQL |
-| **PDF Q&A** | Ask any question; the bot searches all PDFs in the `pdfs/` directory using TF-IDF similarity |
+| **Product Sales** | Ask about monthly sales for any product; Claude queries MySQL and returns a formatted table |
+| **PDF Q&A** | Ask any question; Claude searches all PDFs via semantic vector similarity (ChromaDB + sentence-transformers) |
 | **Attendance – Employee** | Type *"Check in"* or *"Check out"* to record daily attendance |
-| **Attendance – Admin** | Admins type *"Show all attendance"* to view the full report |
+| **Attendance – Admin** | Admins can ask to see all employees' attendance history |
+| **Smart Routing** | Claude autonomously decides which database(s) to query based on the message; no keyword rules needed |
 
 ---
 
@@ -20,14 +21,15 @@ A Python web chatbot that integrates **MySQL product-sales queries**, a **PDF kn
 ```
 chat-bot/
 ├── app.py               # Flask web server & API routes
-├── chatbot.py           # Intent detection & response routing
+├── chatbot.py           # Claude tool-use agentic loop (multi-DB routing)
 ├── database.py          # MySQL connection pool + all queries
-├── pdf_handler.py       # PDF loading, chunking, TF-IDF search
+├── pdf_handler.py       # PDF loading, chunking, ChromaDB vector search
 ├── config.py            # Env-based configuration
 ├── schema.sql           # DB schema + sample seed data
 ├── requirements.txt
 ├── .env.example
 ├── pdfs/                # Drop PDF files here
+├── chroma_db/           # ChromaDB vector store (auto-created, gitignored)
 ├── templates/
 │   ├── base.html
 │   ├── login.html
@@ -48,39 +50,63 @@ Browser (chat UI)
 └──────┬──────┘
        │
        ▼
-┌─────────────┐
-│ chatbot.py  │  Detects intent from message text
-└──────┬──────┘
-       │
-  ┌────┴────────────────────┐
-  │                         │
-  ▼                         ▼
-┌────────────┐     ┌───────────────┐
-│database.py │     │pdf_handler.py │
-│ MySQL pool │     │ TF-IDF search │
-└────────────┘     └───────────────┘
-       │
-       ▼
-   MySQL DB
-  ┌──────────┐ ┌──────────┐ ┌────────────┐
-  │ products │ │  sales   │ │ employees  │
-  │          │ │          │ │ attendance │
-  └──────────┘ └──────────┘ └────────────┘
+┌─────────────────────────────────────────────────┐
+│                  chatbot.py                     │
+│                                                 │
+│  Claude claude-opus-4-7 (tool-use agentic loop) │
+│                                                 │
+│  Claude reads the user message and calls one    │
+│  or more tools to fetch data, then composes a  │
+│  natural-language response.                     │
+└────┬──────────────┬──────────────┬──────────────┘
+     │              │              │
+     ▼              ▼              ▼
+┌──────────┐  ┌──────────┐  ┌─────────────────┐
+│database  │  │database  │  │  pdf_handler.py  │
+│.py       │  │.py       │  │                  │
+│(sales /  │  │(attend-  │  │  ChromaDB +      │
+│products) │  │ance)     │  │  sentence-trans- │
+└────┬─────┘  └────┬─────┘  │  formers embed-  │
+     │              │        │  dings           │
+     ▼              ▼        └────────┬─────────┘
+  MySQL DB                            │
+┌──────────┐ ┌──────────┐             ▼
+│ products │ │  sales   │       chroma_db/
+│ employees│ │attendance│   (persisted vectors)
+└──────────┘ └──────────┘
 ```
 
-### Intent Routing
+### Multi-Database Routing via Claude Tool Use
+
+Claude is given five tools, one per data source. It reads the user's intent and selects the right tool(s) automatically — no keyword rules, no regex, no hardcoded routing.
 
 ```
 User message
     │
-    ├─ "hello / hi / hey"         → greet response
-    ├─ "help"                     → help menu
-    ├─ "check in / checkin"       → mark_attendance(checkin)
-    ├─ "check out / checkout"     → mark_attendance(checkout)
-    ├─ "show attendance / report" → get_attendance_report()
-    ├─ "sales / sold / revenue"   → get_product_sales() from MySQL
-    └─ (anything else)            → answer_from_pdfs() TF-IDF search
+    ▼
+Claude claude-opus-4-7
+    │
+    ├─ sales / revenue / earnings?     → tool: query_product_sales  → MySQL sales
+    ├─ which products exist?           → tool: list_products         → MySQL products
+    ├─ company policy / manual / spec? → tool: search_pdf_library    → ChromaDB (PDFs)
+    ├─ check in / arriving?            → tool: mark_attendance       → MySQL attendance (write)
+    └─ show attendance / history?      → tool: get_attendance_report → MySQL attendance (read)
+
+Claude may call multiple tools in a single response when a question
+spans several data sources (e.g. "compare Laptop Pro sales with our
+return policy").
 ```
+
+### PDF Semantic Search Pipeline
+
+1. On startup, `pdf_handler.load_pdfs()` reads every `.pdf` in `pdfs/`
+2. Each PDF is split into ~600-character sentence-aware chunks
+3. Chunks are embedded using `all-MiniLM-L6-v2` (sentence-transformers, ~80 MB, downloads once)
+4. Embeddings are stored in a local **ChromaDB** persistent collection
+5. On a query, the question is embedded and the top-K most similar chunks are retrieved via cosine similarity
+6. Claude receives the chunks and cites the source filename in its response
+
+ChromaDB persists embeddings to `chroma_db/` — after the first run, restarts are instant.
 
 ### Database Schema
 
@@ -90,14 +116,6 @@ products    (product_id, name, category, price, description)
 sales       (sale_id, product_id, quantity, amount, sale_date, customer_name)
 attendance  (attendance_id, employee_id, date, check_in, check_out, status)
 ```
-
-### PDF Q&A Pipeline
-
-1. On startup `pdf_handler.load_pdfs()` reads every `.pdf` in `pdfs/`
-2. Each PDF is split into ~600-character overlapping chunks
-3. On a question, TF-IDF vectors (bigrams, English stop-words removed) are computed for all chunks + the question
-4. The chunk with highest cosine similarity is returned with its source filename
-5. Falls back to keyword intersection scoring when `scikit-learn` is unavailable
 
 ---
 
@@ -136,19 +154,27 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+> **Note:** `sentence-transformers` will download the `all-MiniLM-L6-v2` model (~80 MB) on first run.
+
 ### 4. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and set your MySQL credentials:
+Edit `.env` with your credentials:
 
-```
+```env
+# MySQL
 DB_HOST=localhost
 DB_USER=root
 DB_PASSWORD=your_password
 DB_NAME=chatbot_db
+
+# Anthropic — get your key at https://console.anthropic.com
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Flask
 SECRET_KEY=replace-with-a-long-random-string
 ```
 
@@ -171,6 +197,8 @@ Copy any `.pdf` files into the `pdfs/` directory:
 cp ~/my-documents/*.pdf pdfs/
 ```
 
+PDFs are indexed automatically on startup. Use the **Reload PDFs** button in the UI (admin only) to re-index after adding new files.
+
 ### 7. Run the application
 
 ```bash
@@ -188,36 +216,43 @@ Open your browser at **http://localhost:5000**
 ```
 You:  Show sales for Laptop Pro
 Bot:  [table: Product | Units Sold | Revenue | Transactions]
-```
 
-```
-You:  What are the sales for Monitor 4K?
-Bot:  [table with this month's figures]
+You:  What are March 2026 earnings for Monitor 4K?
+Bot:  [table with March figures]
 ```
 
 ### PDF Questions
 
 ```
 You:  What is the return policy?
-Bot:  Source: company-policy.pdf
-      Customers may return products within 30 days of purchase...
+Bot:  According to company-policy.pdf: Customers may return products
+      within 30 days of purchase...
 ```
 
 ### Attendance
 
 ```
 You:  Check in
-Bot:  Check-in marked at 09:02:14.
+Bot:  Check-in recorded at 09:02:14.
 
 You:  Check out
-Bot:  Check-out marked at 17:45:33.
+Bot:  Check-out recorded at 17:45:33.
 ```
 
-### Admin – View Attendance
+### Admin – View All Attendance
 
 ```
 You:  Show all attendance
 Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
+```
+
+### Multi-source query
+
+```
+You:  What does the warranty policy say, and how many warranties
+      were sold last month?
+Bot:  [calls search_pdf_library AND query_product_sales, then
+       combines both answers in a single response]
 ```
 
 ---
@@ -228,7 +263,7 @@ Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
 |---|---|---|---|
 | `POST` | `/api/chat` | session | Send a chat message |
 | `GET`  | `/api/pdfs` | session | List loaded PDF files |
-| `POST` | `/api/reload-pdfs` | admin | Re-scan `pdfs/` directory |
+| `POST` | `/api/reload-pdfs` | admin | Re-scan `pdfs/` and rebuild ChromaDB index |
 | `POST` | `/login` | — | Authenticate |
 | `GET`  | `/logout` | — | Clear session |
 
@@ -251,7 +286,7 @@ Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
   "type": "sales_table",
   "month": "April 2026",
   "product": "laptop pro",
-  "data": [{ "name": "Laptop Pro", "total_quantity": 8, "total_amount": "7999.92", "total_transactions": 2 }]
+  "data": [{ "name": "Laptop Pro", "total_quantity": 8, "total_amount": 7999.92, "total_transactions": 2 }]
 }
 ```
 
@@ -279,8 +314,12 @@ Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
 | `DB_PASSWORD` | _(empty)_ | MySQL password |
 | `DB_NAME` | `chatbot_db` | Database name |
 | `DB_PORT` | `3306` | MySQL port |
+| `ANTHROPIC_API_KEY` | _(required)_ | Anthropic API key — get one at console.anthropic.com |
+| `LLM_FAST` | `claude-haiku-4-5` | Model used for fast/simple tasks |
+| `LLM_SMART` | `claude-opus-4-7` | Model used for tool-use reasoning and responses |
 | `PDF_DIR` | `./pdfs` | Path to PDF directory |
-| `SECRET_KEY` | _(insecure default)_ | Flask session secret – **change in production** |
+| `CHROMA_DIR` | `./chroma_db` | Path where ChromaDB persists embeddings |
+| `SECRET_KEY` | _(insecure default)_ | Flask session secret — **change in production** |
 
 ---
 
@@ -299,7 +338,8 @@ Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
 - Use a strong, random `SECRET_KEY`
 - Run MySQL with a dedicated user and restricted privileges
 - Place the app behind a reverse proxy (nginx) with HTTPS
-- For large PDF libraries consider replacing TF-IDF with a vector database (pgvector, Chroma)
+- The `chroma_db/` directory is a generated artifact — back it up or rebuild from PDFs
+- To force a full re-index of PDFs, delete `chroma_db/` and restart (or use the Reload PDFs API)
 
 ---
 
@@ -308,8 +348,10 @@ Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
 | Layer | Technology |
 |---|---|
 | Web framework | Flask 3 |
+| LLM & tool use | Anthropic Claude (`claude-opus-4-7`) via `anthropic` SDK |
 | Database | MySQL 8 + mysql-connector-python |
+| Vector store | ChromaDB (local persistent) |
+| Embeddings | sentence-transformers `all-MiniLM-L6-v2` |
 | PDF parsing | PyPDF2 |
-| Semantic search | scikit-learn TF-IDF + cosine similarity |
 | Frontend | Vanilla JS + CSS (no framework) |
 | Auth | Flask sessions + SHA-256 password hashing |
