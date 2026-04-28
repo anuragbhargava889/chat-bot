@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}ChatBot{% endblock %}
+
+{% block content %}
+<div class="app-layout">
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────── -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <svg class="sidebar-logo" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="20" cy="20" r="20" fill="#4f46e5"/>
+        <path d="M12 26c0-4.418 3.582-8 8-8s8 3.582 8 8" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+        <circle cx="20" cy="14" r="4" fill="#fff"/>
+      </svg>
+      <span class="sidebar-title">ChatBot</span>
+    </div>
+
+    <div class="sidebar-user">
+      <div class="user-avatar">{{ user.name[0].upper() }}</div>
+      <div class="user-info">
+        <span class="user-name">{{ user.name }}</span>
+        <span class="user-role badge badge-{{ user.role }}">{{ user.role }}</span>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <p class="nav-label">Quick commands</p>
+      <button class="quick-btn" data-msg="Show sales for Laptop Pro">Laptop sales</button>
+      <button class="quick-btn" data-msg="Show sales for Monitor 4K">Monitor sales</button>
+      <button class="quick-btn" data-msg="Check in">Check in</button>
+      <button class="quick-btn" data-msg="Check out">Check out</button>
+      {% if user.role == 'admin' %}
+      <button class="quick-btn" data-msg="Show all attendance">All attendance</button>
+      <button class="quick-btn admin-btn" id="reload-pdfs-btn">Reload PDFs</button>
+      {% else %}
+      <button class="quick-btn" data-msg="Show attendance">My attendance</button>
+      {% endif %}
+    </nav>
+
+    <div class="sidebar-pdfs">
+      <p class="nav-label">PDF Library <span id="pdf-count"></span></p>
+      <ul id="pdf-list" class="pdf-list"></ul>
+    </div>
+
+    <a href="{{ url_for('logout') }}" class="logout-link">Sign out</a>
+  </aside>
+
+  <!-- ── Chat area ─────────────────────────────────────────────────── -->
+  <main class="chat-main">
+    <header class="chat-header">
+      <h2>Chat</h2>
+      <span class="status-dot"></span>
+      <span class="status-label">Online</span>
+    </header>
+
+    <div class="messages" id="messages">
+      <div class="message bot">
+        <div class="bubble">
+          Hello, <strong>{{ user.name }}</strong>! How can I help you today?<br/>
+          Type <strong>help</strong> to see what I can do.
+        </div>
+      </div>
+    </div>
+
+    <form class="chat-form" id="chat-form" autocomplete="off">
+      <input
+        id="chat-input"
+        type="text"
+        placeholder="Type a message…"
+        aria-label="Message input"
+      />
+      <button type="submit" class="btn btn-send" aria-label="Send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </form>
+  </main>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+{% endblock %}
