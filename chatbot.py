@@ -1,8 +1,8 @@
 """
-Chatbot core — uses the Anthropic SDK tool runner so the SDK manages the
-agentic loop automatically.  Each data source is a @beta_tool function;
-the SDK calls Claude, executes whichever tools it requests, feeds results
-back, and repeats until Claude is done.
+Chatbot core — uses LangChain's tool-calling agent so the framework manages
+the agentic loop automatically.  Each data source is a @tool function;
+LangChain calls the Ollama LLM, executes whichever tools it requests, feeds
+results back, and repeats until the LLM is done.
 
   query_product_sales   → MySQL sales table
   list_products         → MySQL products table
@@ -13,12 +13,14 @@ back, and repeats until Claude is done.
 
 import json
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Optional
 
-import anthropic
-from anthropic import beta_tool
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain_ollama import ChatOllama
 
-from config import ANTHROPIC_API_KEY, LLM_SMART
+from config import LLM_MODEL, OLLAMA_HOST
 from database import (
     get_all_products,
     get_attendance_report as db_get_attendance,
@@ -27,19 +29,7 @@ from database import (
 )
 from pdf_handler import query_pdfs
 
-# ── Anthropic client ──────────────────────────────────────────────────────────
-
-_client: anthropic.Anthropic | None = None
-
-
-def _anthropic() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    return _client
-
-
-# ── System prompt (cached on the first request) ───────────────────────────────
+# ── System prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM = """You are a professional company assistant chatbot connected to multiple databases and document repositories.
 
@@ -62,12 +52,12 @@ Behaviour rules:
 
 def process_message(message: str, user: dict | None = None) -> dict:
     """
-    Process one chat message through the Claude tool-use agent loop.
+    Process one chat message through the LangChain tool-calling agent loop.
 
-    The Anthropic SDK tool runner calls Claude, executes requested tools,
-    feeds results back, and repeats automatically.  Tool closures write
-    structured results into _results; after the loop we map them to the
-    response type the frontend understands:
+    ChatOllama calls the local Ollama LLM, which decides which tools to call.
+    AgentExecutor runs the loop: LLM → tool call → result → LLM → … until done.
+    Tool closures write structured results into _results; after the loop we map
+    them to the response type the frontend understands:
 
         type == "text"             → plain text bubble
         type == "sales_table"      → rendered HTML table
@@ -75,7 +65,6 @@ def process_message(message: str, user: dict | None = None) -> dict:
         type == "attendance"       → check-in / check-out confirmation badge
         type == "error"            → red error message
     """
-    client = _anthropic()
     now = datetime.now()
 
     # Mutable results bag — tool closures write here, we read after the loop
@@ -88,9 +77,9 @@ def process_message(message: str, user: dict | None = None) -> dict:
     # ── Tool definitions ──────────────────────────────────────────────────────
     #
     # Defined as closures so they capture `user`, `now`, and `_results`
-    # without exposing those as tool parameters to Claude.
+    # without exposing those as tool parameters to the LLM.
 
-    @beta_tool
+    @tool
     def query_product_sales(
         product_name: str,
         month: Optional[int] = None,
@@ -129,7 +118,7 @@ def process_message(message: str, user: dict | None = None) -> dict:
         _results["sales"] = result
         return json.dumps(result)
 
-    @beta_tool
+    @tool
     def list_products() -> str:
         """Fetch the full product catalogue from the Products database.
 
@@ -148,7 +137,7 @@ def process_message(message: str, user: dict | None = None) -> dict:
             ]
         })
 
-    @beta_tool
+    @tool
     def search_pdf_library(question: str, top_k: int = 3) -> str:
         """Semantic search over the company PDF document library.
 
@@ -170,8 +159,8 @@ def process_message(message: str, user: dict | None = None) -> dict:
             ],
         })
 
-    @beta_tool
-    def mark_attendance(action: Literal["checkin", "checkout"]) -> str:
+    @tool
+    def mark_attendance(action: str) -> str:
         """Record an employee's check-in or check-out in the Attendance database.
 
         Use when the user says they are checking in, arriving, checking out, or leaving.
@@ -179,6 +168,8 @@ def process_message(message: str, user: dict | None = None) -> dict:
         Args:
             action: 'checkin' when arriving; 'checkout' when leaving.
         """
+        if action not in ("checkin", "checkout"):
+            return json.dumps({"success": False, "message": "action must be 'checkin' or 'checkout'."})
         if not user:
             return json.dumps({"success": False, "message": "You must be logged in to mark attendance."})
         result = db_mark_attendance(user["employee_id"], action)
@@ -186,7 +177,7 @@ def process_message(message: str, user: dict | None = None) -> dict:
         _results["attendance_action"] = outcome
         return json.dumps(outcome)
 
-    @beta_tool
+    @tool
     def get_attendance_report(all_employees: bool = False) -> str:
         """Retrieve attendance records from the Attendance database.
 
@@ -208,7 +199,15 @@ def process_message(message: str, user: dict | None = None) -> dict:
         _results["attendance_table"] = records
         return json.dumps({"success": True, "records": records, "all_employees": all_employees})
 
-    # ── Run the agent via the SDK tool runner ─────────────────────────────────
+    # ── Build and run the LangChain agent ────────────────────────────────────
+
+    agent_tools = [
+        query_product_sales,
+        list_products,
+        search_pdf_library,
+        mark_attendance,
+        get_attendance_report,
+    ]
 
     user_ctx = (
         f"Current user: {user['name']} | role: {user['role']} | "
@@ -217,37 +216,26 @@ def process_message(message: str, user: dict | None = None) -> dict:
         else "User is not authenticated."
     )
 
-    try:
-        runner = client.beta.messages.tool_runner(
-            model=LLM_SMART,
-            max_tokens=1024,
-            system=[
-                {
-                    "type": "text",
-                    "text": f"{_SYSTEM}\n\n{user_ctx}",
-                    # Cache the system prompt so repeated requests within the
-                    # same session skip re-tokenising it.
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            tools=[
-                query_product_sales,
-                list_products,
-                search_pdf_library,
-                mark_attendance,
-                get_attendance_report,
-            ],
-            messages=[{"role": "user", "content": message}],
-        )
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", f"{_SYSTEM}\n\n{{user_ctx}}"),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
 
-        final_message = None
-        for msg in runner:
-            final_message = msg
+    try:
+        llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_HOST, temperature=0)
+        agent = create_tool_calling_agent(llm, agent_tools, prompt)
+        executor = AgentExecutor(
+            agent=agent,
+            tools=agent_tools,
+            max_iterations=6,
+            handle_parsing_errors=True,
+            verbose=False,
+        )
+        result = executor.invoke({"input": message, "user_ctx": user_ctx})
+        final_text = result.get("output", "")
 
     except Exception:
-        return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
-
-    if final_message is None:
         return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
 
     # ── Map collected results to structured frontend response types ───────────
@@ -268,7 +256,4 @@ def process_message(message: str, user: dict | None = None) -> dict:
             "product": _results["sales"]["product"],
         }
 
-    final_text = next(
-        (b.text for b in final_message.content if b.type == "text"), ""
-    )
     return {"type": "text", "message": final_text}
