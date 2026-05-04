@@ -2,6 +2,8 @@
 PDF handler — loads PDFs, embeds them with sentence-transformers, stores
 chunks in ChromaDB, and exposes semantic search via query_pdfs().
 """
+from __future__ import annotations
+
 import os
 import re
 
