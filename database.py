@@ -1,7 +1,19 @@
 import mysql.connector
 from mysql.connector import pooling, Error
 from datetime import date, datetime
+from decimal import Decimal
 from config import DB_CONFIG
+
+
+def _sanitize(rows: list[dict]) -> list[dict]:
+    """Convert Decimal/date/datetime values so rows are JSON-serializable."""
+    for row in rows:
+        for key, val in row.items():
+            if isinstance(val, Decimal):
+                row[key] = float(val)
+            elif isinstance(val, (date, datetime)):
+                row[key] = str(val)
+    return rows
 
 _pool = None
 
@@ -40,7 +52,7 @@ def get_product_sales(product_name, month=None, year=None):
             """,
             (f"%{product_name}%", month, year),
         )
-        return cursor.fetchall()
+        return _sanitize(cursor.fetchall())
     finally:
         cursor.close()
         conn.close()
@@ -51,7 +63,7 @@ def get_all_products():
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute("SELECT product_id, name, category, price FROM products ORDER BY name")
-        return cursor.fetchall()
+        return _sanitize(cursor.fetchall())
     finally:
         cursor.close()
         conn.close()
@@ -135,13 +147,7 @@ def get_attendance_report(employee_id=None):
                 LIMIT 200
                 """
             )
-        rows = cursor.fetchall()
-        # Convert date/datetime to strings for JSON serialisation
-        for row in rows:
-            for key, val in row.items():
-                if isinstance(val, (date, datetime)):
-                    row[key] = str(val)
-        return rows
+        return _sanitize(cursor.fetchall())
     finally:
         cursor.close()
         conn.close()

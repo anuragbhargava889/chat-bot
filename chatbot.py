@@ -97,10 +97,9 @@ def _make_tools(user, now, _results: dict):
                     f"in {datetime(y, m, 1).strftime('%B %Y')}."
                 ),
             })
-        clean = [{**r, "total_amount": float(r["total_amount"])} for r in rows]
         result = {
             "found": True,
-            "rows": clean,
+            "rows": rows,
             "product": product_name,
             "month": m,
             "year": y,
@@ -119,11 +118,7 @@ def _make_tools(user, now, _results: dict):
         products = get_all_products()
         return json.dumps({
             "products": [
-                {
-                    "name": p["name"],
-                    "category": p.get("category", ""),
-                    "price": float(p["price"]),
-                }
+                {"name": p["name"], "category": p.get("category", ""), "price": p["price"]}
                 for p in products
             ]
         })
