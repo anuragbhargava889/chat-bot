@@ -1,9 +1,12 @@
 """
-Chatbot core — uses LangChain's tool-calling agent so the framework manages
-the agentic loop automatically.  Each data source is a @tool function;
-LangChain calls the Ollama LLM, executes whichever tools it requests, feeds
-results back, and repeats until the LLM is done.
+Chatbot core — manual tool-calling loop via ChatOllama + bind_tools.
 
+The LLM is given bound tools; we run the loop ourselves:
+  1. Call LLM with current messages
+  2. If it requests tool calls → execute them, append results, repeat
+  3. When no tool calls remain → return the final text
+
+Tools:
   query_product_sales   → MySQL sales table
   list_products         → MySQL products table
   get_attendance_report → MySQL attendance table (read)
@@ -15,8 +18,7 @@ import json
 from datetime import datetime
 from typing import Optional
 
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 
@@ -52,10 +54,10 @@ Behaviour rules:
 
 def process_message(message: str, user: dict | None = None) -> dict:
     """
-    Process one chat message through the LangChain tool-calling agent loop.
+    Process one chat message through a manual tool-calling loop.
 
-    ChatOllama calls the local Ollama LLM, which decides which tools to call.
-    AgentExecutor runs the loop: LLM → tool call → result → LLM → … until done.
+    We call ChatOllama with bound tools, check for tool calls in the response,
+    execute them, and feed results back until the LLM stops requesting tools.
     Tool closures write structured results into _results; after the loop we map
     them to the response type the frontend understands:
 
@@ -199,7 +201,7 @@ def process_message(message: str, user: dict | None = None) -> dict:
         _results["attendance_table"] = records
         return json.dumps({"success": True, "records": records, "all_employees": all_employees})
 
-    # ── Build and run the LangChain agent ────────────────────────────────────
+    # ── Build tool registry and bind to LLM ───────────────────────────────────
 
     agent_tools = [
         query_product_sales,
@@ -208,6 +210,7 @@ def process_message(message: str, user: dict | None = None) -> dict:
         mark_attendance,
         get_attendance_report,
     ]
+    tool_map = {t.name: t for t in agent_tools}
 
     user_ctx = (
         f"Current user: {user['name']} | role: {user['role']} | "
@@ -216,26 +219,34 @@ def process_message(message: str, user: dict | None = None) -> dict:
         else "User is not authenticated."
     )
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", f"{_SYSTEM}\n\n{{user_ctx}}"),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
+    # ── Run the manual tool-calling loop ──────────────────────────────────────
 
     try:
         llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_HOST, temperature=0)
-        agent = create_tool_calling_agent(llm, agent_tools, prompt)
-        executor = AgentExecutor(
-            agent=agent,
-            tools=agent_tools,
-            max_iterations=6,
-            handle_parsing_errors=True,
-            verbose=False,
-        )
-        result = executor.invoke({"input": message, "user_ctx": user_ctx})
-        final_text = result.get("output", "")
+        llm_with_tools = llm.bind_tools(agent_tools)
+
+        messages = [
+            SystemMessage(content=f"{_SYSTEM}\n\n{user_ctx}"),
+            HumanMessage(content=message),
+        ]
+
+        response: AIMessage | None = None
+        for _ in range(6):
+            response = llm_with_tools.invoke(messages)
+            messages.append(response)
+
+            if not response.tool_calls:
+                break
+
+            for call in response.tool_calls:
+                fn = tool_map.get(call["name"])
+                result = fn.invoke(call["args"]) if fn else f"Unknown tool: {call['name']}"
+                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
     except Exception:
+        return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
+
+    if response is None:
         return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
 
     # ── Map collected results to structured frontend response types ───────────
@@ -256,4 +267,5 @@ def process_message(message: str, user: dict | None = None) -> dict:
             "product": _results["sales"]["product"],
         }
 
+    final_text = response.content if isinstance(response.content, str) else ""
     return {"type": "text", "message": final_text}
