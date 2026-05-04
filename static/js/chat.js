@@ -53,6 +53,10 @@
   }
 
   function renderResponse(data) {
+    if (data.type === 'error') {
+      return `<span class="status-error">${escHtml(data.message || 'An error occurred.')}</span>`;
+    }
+
     if (data.type === 'text' || data.type === 'attendance') {
       const cls = data.status === 'error' ? 'status-error' : data.status === 'success' ? 'status-success' : '';
       const msg = renderMarkdown(escHtml(data.message));
@@ -110,18 +114,27 @@
 
     const typing = showTyping();
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 180000); // 3-min timeout
+
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
+        signal: controller.signal,
       });
+      clearTimeout(timer);
       const data = await res.json();
       typing.remove();
       appendMessage('bot', renderResponse(data));
     } catch (err) {
+      clearTimeout(timer);
       typing.remove();
-      appendMessage('bot', '<span class="status-error">Network error. Please try again.</span>');
+      const msg = err.name === 'AbortError'
+        ? 'Request timed out. The model may be overloaded — please try again.'
+        : 'Network error. Please try again.';
+      appendMessage('bot', `<span class="status-error">${msg}</span>`);
     } finally {
       input.disabled = false;
       input.focus();
