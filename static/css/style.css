@@ -168,6 +168,7 @@ html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; font-
 /* ── Status badge in attendance messages ─────────────────────────────────── */
 .status-success { color: var(--success); font-weight: 700; }
 .status-error   { color: var(--danger);  font-weight: 700; }
+.status-muted   { color: var(--muted);   font-size: .85rem; font-style: italic; }
 
 /* ── Chat form ───────────────────────────────────────────────────────────── */
 .chat-form {

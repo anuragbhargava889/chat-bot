@@ -1,10 +1,9 @@
 """
 Chatbot core — manual tool-calling loop via ChatOllama + bind_tools.
 
-The LLM is given bound tools; we run the loop ourselves:
-  1. Call LLM with current messages
-  2. If it requests tool calls → execute them, append results, repeat
-  3. When no tool calls remain → return the final text
+Two entry points:
+  process_message() → dict          (kept for compatibility)
+  stream_message()  → NDJSON events (used by the SSE endpoint)
 
 Tools:
   query_product_sales   → MySQL sales table
@@ -13,12 +12,13 @@ Tools:
   mark_attendance       → MySQL attendance table (write)
   search_pdf_library    → ChromaDB vector store (PDFs)
 """
+from __future__ import annotations
 
 import json
 from datetime import datetime
 from typing import Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 
@@ -50,36 +50,25 @@ Behaviour rules:
 6. Be concise and professional; avoid unnecessary preamble."""
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ── Shared helpers ────────────────────────────────────────────────────────────
 
-def process_message(message: str, user: dict | None = None) -> dict:
+def _extract_text(content) -> str:
+    """Pull plain text from a str, list-of-blocks, or any content value."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content
+        )
+    return str(content) if content else ""
+
+
+def _make_tools(user, now, _results: dict):
     """
-    Process one chat message through a manual tool-calling loop.
-
-    We call ChatOllama with bound tools, check for tool calls in the response,
-    execute them, and feed results back until the LLM stops requesting tools.
-    Tool closures write structured results into _results; after the loop we map
-    them to the response type the frontend understands:
-
-        type == "text"             → plain text bubble
-        type == "sales_table"      → rendered HTML table
-        type == "attendance_table" → rendered HTML table
-        type == "attendance"       → check-in / check-out confirmation badge
-        type == "error"            → red error message
+    Factory: returns (agent_tools, tool_map) with closures capturing
+    user, now, and _results so those never appear as LLM parameters.
     """
-    now = datetime.now()
-
-    # Mutable results bag — tool closures write here, we read after the loop
-    _results: dict = {
-        "sales": None,
-        "attendance_table": None,
-        "attendance_action": None,
-    }
-
-    # ── Tool definitions ──────────────────────────────────────────────────────
-    #
-    # Defined as closures so they capture `user`, `now`, and `_results`
-    # without exposing those as tool parameters to the LLM.
 
     @tool
     def query_product_sales(
@@ -201,8 +190,6 @@ def process_message(message: str, user: dict | None = None) -> dict:
         _results["attendance_table"] = records
         return json.dumps({"success": True, "records": records, "all_employees": all_employees})
 
-    # ── Build tool registry and bind to LLM ───────────────────────────────────
-
     agent_tools = [
         query_product_sales,
         list_products,
@@ -210,49 +197,11 @@ def process_message(message: str, user: dict | None = None) -> dict:
         mark_attendance,
         get_attendance_report,
     ]
-    tool_map = {t.name: t for t in agent_tools}
+    return agent_tools, {t.name: t for t in agent_tools}
 
-    user_ctx = (
-        f"Current user: {user['name']} | role: {user['role']} | "
-        f"department: {user.get('department', 'N/A')}."
-        if user
-        else "User is not authenticated."
-    )
 
-    # ── Run the manual tool-calling loop ──────────────────────────────────────
-
-    try:
-        llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_HOST, temperature=0)
-        llm_with_tools = llm.bind_tools(agent_tools)
-
-        messages = [
-            SystemMessage(content=f"{_SYSTEM}\n\n{user_ctx}"),
-            HumanMessage(content=message),
-        ]
-
-        response: AIMessage | None = None
-        for _ in range(6):
-            response = llm_with_tools.invoke(messages)
-            messages.append(response)
-
-            if not response.tool_calls:
-                break
-
-            for call in response.tool_calls:
-                fn = tool_map.get(call["name"])
-                result = fn.invoke(call["args"]) if fn else f"Unknown tool: {call['name']}"
-                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
-
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        return {"type": "error", "message": f"Error: {exc}"}
-
-    if response is None:
-        return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
-
-    # ── Map collected results to structured frontend response types ───────────
-
+def _structured_result(_results: dict, response) -> dict | None:
+    """Map tool results to a structured frontend response, or None for text."""
     if _results["attendance_action"]:
         return {
             "type": "attendance",
@@ -268,20 +217,141 @@ def process_message(message: str, user: dict | None = None) -> dict:
             "month": _results["sales"]["period"],
             "product": _results["sales"]["product"],
         }
+    return None
 
-    content = response.content
-    if isinstance(content, str):
-        final_text = content
-    elif isinstance(content, list):
-        # Ollama sometimes returns a list of content blocks after tool use
-        final_text = "".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content
-        )
-    else:
-        final_text = str(content) if content else ""
 
-    if not final_text.strip():
-        final_text = "Done — let me know if you need anything else."
+def _run_tool_calls(tool_calls, tool_map, messages):
+    """Execute a list of tool calls and append ToolMessages."""
+    for call in tool_calls:
+        fn = tool_map.get(call["name"])
+        result = fn.invoke(call["args"]) if fn else f"Unknown tool: {call['name']}"
+        messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
-    return {"type": "text", "message": final_text}
+
+# ── Streaming entry point (SSE) ───────────────────────────────────────────────
+
+def stream_message(message: str, user: dict | None = None):
+    """
+    Generator yielding newline-delimited JSON events for SSE.
+
+    Event shapes:
+        {"status": "..."}              — shown in typing indicator during tool use
+        {"token": "..."}              — text token streamed to a live bubble
+        {"done": true}                — text streaming complete (no more tokens)
+        {"done": true, "data": {...}} — structured response (table / attendance / error)
+    """
+    now = datetime.now()
+    _results: dict = {"sales": None, "attendance_table": None, "attendance_action": None}
+    agent_tools, tool_map = _make_tools(user, now, _results)
+
+    user_ctx = (
+        f"Current user: {user['name']} | role: {user['role']} | "
+        f"department: {user.get('department', 'N/A')}."
+        if user
+        else "User is not authenticated."
+    )
+
+    try:
+        llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_HOST, temperature=0)
+        llm_with_tools = llm.bind_tools(agent_tools)
+
+        messages = [
+            SystemMessage(content=f"{_SYSTEM}\n\n{user_ctx}"),
+            HumanMessage(content=message),
+        ]
+
+        # ── First call: stream so text responses appear token-by-token ────────
+        accumulated: AIMessageChunk | None = None
+        tool_call_detected = False
+
+        for chunk in llm_with_tools.stream(messages):
+            if getattr(chunk, "tool_call_chunks", None):
+                tool_call_detected = True
+
+            accumulated = chunk if accumulated is None else accumulated + chunk
+
+            if not tool_call_detected:
+                token = _extract_text(chunk.content)
+                if token:
+                    yield json.dumps({"token": token}) + "\n"
+
+        if accumulated is None:
+            yield json.dumps({
+                "done": True,
+                "data": {"type": "error", "message": "No response received from model."},
+            }) + "\n"
+            return
+
+        tool_calls = getattr(accumulated, "tool_calls", [])
+
+        # ── No tool calls → streaming is done ────────────────────────────────
+        if not tool_call_detected and not tool_calls:
+            yield json.dumps({"done": True}) + "\n"
+            return
+
+        # ── Tool calls detected → execute, then continue with invoke() ────────
+        messages.append(accumulated)
+
+        if not tool_calls:
+            yield json.dumps({"done": True}) + "\n"
+            return
+
+        for call in tool_calls:
+            name = call.get("name", "tool")
+            label = name.replace("_", " ")
+            yield json.dumps({"status": f"Running {label}…"}) + "\n"
+        _run_tool_calls(tool_calls, tool_map, messages)
+
+        response: AIMessage | None = None
+        for _ in range(5):
+            response = llm_with_tools.invoke(messages)
+            messages.append(response)
+            if not response.tool_calls:
+                break
+            for call in response.tool_calls:
+                name = call.get("name", "tool")
+                yield json.dumps({"status": f"Running {name.replace('_', ' ')}…"}) + "\n"
+            _run_tool_calls(response.tool_calls, tool_map, messages)
+
+        # ── Map results to structured or text response ────────────────────────
+        structured = _structured_result(_results, response)
+        if structured:
+            yield json.dumps({"done": True, "data": structured}) + "\n"
+            return
+
+        final_text = _extract_text(response.content if response else "")
+        if not final_text.strip():
+            final_text = "Done — let me know if you need anything else."
+
+        yield json.dumps({"done": True, "data": {"type": "text", "message": final_text}}) + "\n"
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        yield json.dumps({
+            "done": True,
+            "data": {"type": "error", "message": f"Error: {exc}"},
+        }) + "\n"
+
+
+# ── Synchronous entry point (kept for compatibility) ──────────────────────────
+
+def process_message(message: str, user: dict | None = None) -> dict:
+    """Synchronous wrapper — collects stream_message() into a single dict."""
+    last: dict = {"type": "error", "message": "No response."}
+    for line in stream_message(message, user):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except Exception:
+            continue
+        if evt.get("done"):
+            last = evt.get("data") or {"type": "text", "message": "Done."}
+        elif evt.get("token"):
+            # Accumulate tokens (fallback — streaming should be used instead)
+            if last.get("type") != "text":
+                last = {"type": "text", "message": ""}
+            last["message"] = last.get("message", "") + evt["token"]
+    return last

@@ -112,7 +112,9 @@
     input.disabled = true;
     appendMessage('user', escHtml(text));
 
-    const typing = showTyping();
+    const typingEl = showTyping();
+    let typingGone = false;
+    const clearTyping = () => { if (!typingGone) { typingGone = true; typingEl.remove(); } };
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 180000); // 3-min timeout
@@ -125,12 +127,71 @@
         signal: controller.signal,
       });
       clearTimeout(timer);
-      const data = await res.json();
-      typing.remove();
-      appendMessage('bot', renderResponse(data));
+
+      if (!res.ok) {
+        clearTyping();
+        appendMessage('bot', '<span class="status-error">Server error. Please try again.</span>');
+        return;
+      }
+
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer      = '';
+      let streamBubble = null;
+      let streamText   = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';   // keep the last incomplete line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let evt;
+          try { evt = JSON.parse(line); } catch { continue; }
+
+          if (evt.status !== undefined) {
+            // Update typing indicator text while tools run
+            if (!typingGone) {
+              typingEl.querySelector('.bubble').innerHTML =
+                `<span class="status-muted">${escHtml(evt.status)}</span>`;
+            }
+
+          } else if (evt.token !== undefined) {
+            // First token: replace typing indicator with a live bubble
+            if (!streamBubble) {
+              clearTyping();
+              streamBubble = appendMessage('bot', '');
+            }
+            streamText += evt.token;
+            streamBubble.querySelector('.bubble').innerHTML = renderMarkdown(escHtml(streamText));
+            scrollBottom();
+
+          } else if (evt.done !== undefined) {
+            clearTyping();
+            if (evt.data) {
+              // Structured response (table, attendance, error, or text after tool use)
+              if (streamBubble) {
+                streamBubble.querySelector('.bubble').innerHTML = renderResponse(evt.data);
+              } else {
+                appendMessage('bot', renderResponse(evt.data));
+              }
+              scrollBottom();
+            }
+            // If no data, streamBubble already holds the complete streamed text
+          }
+        }
+      }
+
+      // Safety: clear typing if stream ended without a done event
+      clearTyping();
+
     } catch (err) {
       clearTimeout(timer);
-      typing.remove();
+      clearTyping();
       const msg = err.name === 'AbortError'
         ? 'Request timed out. The model may be overloaded — please try again.'
         : 'Network error. Please try again.';

@@ -1,8 +1,8 @@
 import hashlib
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 
-from chatbot import process_message
+from chatbot import stream_message
 from config import SECRET_KEY
 from database import get_employee_by_username
 from pdf_handler import get_pdf_list, load_pdfs
@@ -87,8 +87,16 @@ def chat():
     if not message:
         return jsonify({"error": "Empty message."}), 400
 
-    response = process_message(message, _current_user())
-    return jsonify(response)
+    user = _current_user()
+
+    def generate():
+        yield from stream_message(message, user)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="application/x-ndjson",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.route("/api/pdfs")
