@@ -243,8 +243,10 @@ def process_message(message: str, user: dict | None = None) -> dict:
                 result = fn.invoke(call["args"]) if fn else f"Unknown tool: {call['name']}"
                 messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
-    except Exception:
-        return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return {"type": "error", "message": f"Error: {exc}"}
 
     if response is None:
         return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
