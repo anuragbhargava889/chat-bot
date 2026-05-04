@@ -243,8 +243,10 @@ def process_message(message: str, user: dict | None = None) -> dict:
                 result = fn.invoke(call["args"]) if fn else f"Unknown tool: {call['name']}"
                 messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
-    except Exception:
-        return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return {"type": "error", "message": f"Error: {exc}"}
 
     if response is None:
         return {"type": "error", "message": "I encountered an issue processing your request. Please try again."}
@@ -267,5 +269,19 @@ def process_message(message: str, user: dict | None = None) -> dict:
             "product": _results["sales"]["product"],
         }
 
-    final_text = response.content if isinstance(response.content, str) else ""
+    content = response.content
+    if isinstance(content, str):
+        final_text = content
+    elif isinstance(content, list):
+        # Ollama sometimes returns a list of content blocks after tool use
+        final_text = "".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        )
+    else:
+        final_text = str(content) if content else ""
+
+    if not final_text.strip():
+        final_text = "Done — let me know if you need anything else."
+
     return {"type": "text", "message": final_text}
