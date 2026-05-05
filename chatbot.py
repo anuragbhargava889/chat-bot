@@ -1,5 +1,5 @@
 """
-Chatbot core — manual tool-calling loop via ChatOllama + bind_tools.
+Chatbot core — manual tool-calling loop via get_llm() + bind_tools.
 
 Two entry points:
   process_message() → dict          (kept for compatibility)
@@ -20,9 +20,8 @@ from typing import Optional
 
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
-from langchain_ollama import ChatOllama
 
-from config import LLM_MODEL, OLLAMA_HOST
+from config import get_llm
 from database import (
     get_all_products,
     get_attendance_report as db_get_attendance,
@@ -247,7 +246,7 @@ def stream_message(message: str, user: dict | None = None):
     )
 
     try:
-        llm = ChatOllama(model=LLM_MODEL, base_url=OLLAMA_HOST, temperature=0)
+        llm = get_llm()
         llm_with_tools = llm.bind_tools(agent_tools)
 
         messages = [

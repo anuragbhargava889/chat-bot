@@ -1,11 +1,7 @@
 Flask==3.0.3
 mysql-connector-python==8.4.0
 PyPDF2==3.0.1
-# Vector database for semantic PDF search
 chromadb==0.5.23
-# Embedding model used by pdf_handler (downloads ~80 MB on first run)
 sentence-transformers==3.3.1
 python-dotenv==1.0.1
-# Open-source LLM via Ollama; langchain-core for tool + message types
 langchain-core>=0.3.0
-langchain-ollama>=0.2.0
