@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,6 +11,15 @@ DB_CONFIG = {
     'database': os.getenv('DB_NAME', 'chatbot_db'),
     'port': int(os.getenv('DB_PORT', 3306)),
 }
+
+
+def get_db_uri() -> str:
+    """SQLAlchemy connection URI for LangChain SQLDatabase."""
+    c = DB_CONFIG
+    return (
+        f"mysql+mysqlconnector://{quote_plus(c['user'])}:{quote_plus(c['password'])}"
+        f"@{c['host']}:{c['port']}/{c['database']}"
+    )
 
 PDF_DIR = os.getenv('PDF_DIR', os.path.join(os.path.dirname(__file__), 'pdfs'))
 SECRET_KEY = os.getenv('SECRET_KEY', 'change-this-secret-key-in-production')
