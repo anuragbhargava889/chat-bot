@@ -150,6 +150,11 @@ html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; font-
 .chat-table td { padding: .4rem .75rem; border-top: 1px solid var(--border); }
 .chat-table tr:hover td { background: var(--bg); }
 
+/* ── Charts in bubbles ───────────────────────────────────────────────────── */
+.chart-wrapper { margin-top: .5rem; }
+.chart-wrapper strong { display: block; margin-bottom: .5rem; font-size: .95rem; color: var(--text); }
+.chart-canvas-box { position: relative; width: 100%; max-height: 320px; }
+
 /* ── Typing indicator ────────────────────────────────────────────────────── */
 .typing .bubble { background: var(--surface); border: 1px solid var(--border); }
 .typing-dots { display: flex; gap: .3rem; align-items: center; height: 1.2rem; }
@@ -169,6 +174,17 @@ html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; font-
 .status-success { color: var(--success); font-weight: 700; }
 .status-error   { color: var(--danger);  font-weight: 700; }
 .status-muted   { color: var(--muted);   font-size: .85rem; font-style: italic; }
+
+/* ── Suggestion buttons shown after model parse failures ─────────────────── */
+.suggest-label { margin-top: .65rem; font-size: .8rem; color: var(--muted); }
+.suggest-btns  { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .4rem; }
+.suggest-btn {
+  padding: .3rem .65rem; font-size: .8rem; cursor: pointer;
+  background: var(--primary-light); border: 1px solid var(--primary);
+  border-radius: var(--radius); color: var(--primary);
+  transition: background .15s, color .15s;
+}
+.suggest-btn:hover { background: var(--primary); color: #fff; }
 
 /* ── Chat form ───────────────────────────────────────────────────────────── */
 .chat-form {

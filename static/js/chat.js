@@ -8,6 +8,57 @@
   const pdfList    = document.getElementById('pdf-list');
   const pdfCount   = document.getElementById('pdf-count');
 
+  // ── Chart helpers ─────────────────────────────────────────────────────────
+
+  let _chartSeq = 0;
+
+  const PALETTE = [
+    '#4f46e5','#06b6d4','#10b981','#f59e0b','#ef4444',
+    '#8b5cf6','#ec4899','#14b8a6','#f97316','#6366f1',
+  ];
+
+  function _chartColors(n, alpha) {
+    return Array.from({length: n}, (_, i) => {
+      const hex = PALETTE[i % PALETTE.length];
+      if (!alpha) return hex;
+      const r = parseInt(hex.slice(1,3),16);
+      const g = parseInt(hex.slice(3,5),16);
+      const b = parseInt(hex.slice(5,7),16);
+      return `rgba(${r},${g},${b},${alpha})`;
+    });
+  }
+
+  function initChart(canvasId, data) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || typeof Chart === 'undefined') return;
+
+    const isSlice = data.chart_type === 'pie' || data.chart_type === 'doughnut';
+    new Chart(canvas, {
+      type: data.chart_type,
+      data: {
+        labels: data.labels,
+        datasets: [{
+          label: data.dataset_label,
+          data: data.data,
+          backgroundColor: isSlice ? _chartColors(data.labels.length, 0.8) : _chartColors(1, 0.75),
+          borderColor:     isSlice ? _chartColors(data.labels.length)       : PALETTE[0],
+          borderWidth: 1,
+          fill: data.chart_type === 'line',
+          tension: 0.3,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: {
+          legend: { position: isSlice ? 'right' : 'top', labels: { boxWidth: 12, font: { size: 12 } } },
+          title:  { display: false },
+        },
+        scales: isSlice ? {} : { y: { beginAtZero: true, ticks: { font: { size: 11 } } }, x: { ticks: { font: { size: 11 } } } },
+      },
+    });
+  }
+
   // ── helpers ──────────────────────────────────────────────────────────────
 
   function scrollBottom() {
@@ -22,9 +73,40 @@
       .replace(/"/g, '&quot;');
   }
 
-  /** Very small Markdown renderer: **bold**, *italic*, bullet lists, line breaks */
+  /** Very small Markdown renderer: **bold**, *italic*, bullet lists, tables, line breaks.
+   *  NOTE: text must already be HTML-escaped before calling this function. */
   function renderMarkdown(text) {
-    return text
+    // Convert markdown tables to <table> HTML
+    const lines = text.split('\n');
+    const out   = [];
+    let tbl     = [];
+
+    const flushTable = () => {
+      if (tbl.length < 2) { out.push(...tbl); tbl = []; return; }
+      const isSep  = l => /^\s*\|[-\s|:]+\|\s*$/.test(l);
+      const parseRow = l => l.replace(/^\s*\||\|\s*$/g, '').split('|').map(c => c.trim());
+      const rows   = tbl.filter(l => !isSep(l));
+      if (!rows.length) { out.push(...tbl); tbl = []; return; }
+      const [hdr, ...body] = rows;
+      const ths = parseRow(hdr).map(c => `<th>${c}</th>`).join('');
+      const trs = body.map(r =>
+        `<tr>${parseRow(r).map(c => `<td>${c}</td>`).join('')}</tr>`
+      ).join('');
+      out.push(`<table class="chat-table"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`);
+      tbl = [];
+    };
+
+    for (const line of lines) {
+      if (line.trim().startsWith('|')) {
+        tbl.push(line);
+      } else {
+        if (tbl.length) flushTable();
+        out.push(line);
+      }
+    }
+    if (tbl.length) flushTable();
+
+    return out.join('\n')
       .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.+?)\*/g, '<em>$1</em>')
       .replace(/^[-•]\s(.+)/gm, '<li>$1</li>')
@@ -54,13 +136,30 @@
 
   function renderResponse(data) {
     if (data.type === 'error') {
-      return `<span class="status-error">${escHtml(data.message || 'An error occurred.')}</span>`;
+      let html = `<span class="status-error">${escHtml(data.message || 'An error occurred.')}</span>`;
+      if (data.suggestions && data.suggestions.length) {
+        html += '<p class="suggest-label">Try asking:</p><div class="suggest-btns">' +
+          data.suggestions.map(s =>
+            `<button class="suggest-btn" data-suggest="${escHtml(s)}">${escHtml(s)}</button>`
+          ).join('') +
+          '</div>';
+      }
+      return html;
     }
 
     if (data.type === 'text' || data.type === 'attendance') {
       const cls = data.status === 'error' ? 'status-error' : data.status === 'success' ? 'status-success' : '';
       const msg = renderMarkdown(escHtml(data.message));
       return cls ? `<span class="${cls}">${msg}</span>` : msg;
+    }
+
+    if (data.type === 'chart') {
+      const id = `chart-canvas-${++_chartSeq}`;
+      data._canvasId = id;
+      return `<div class="chart-wrapper">
+        <strong>${escHtml(data.title)}</strong>
+        <div class="chart-canvas-box"><canvas id="${id}"></canvas></div>
+      </div>`;
     }
 
     if (data.type === 'sales_table') {
@@ -173,13 +272,18 @@
           } else if (evt.done !== undefined) {
             clearTyping();
             if (evt.data) {
-              // Structured response (table, attendance, error, or text after tool use)
+              // Structured response (chart, table, attendance, error, or text after tool use)
+              const html = renderResponse(evt.data);
               if (streamBubble) {
-                streamBubble.querySelector('.bubble').innerHTML = renderResponse(evt.data);
+                streamBubble.querySelector('.bubble').innerHTML = html;
               } else {
-                appendMessage('bot', renderResponse(evt.data));
+                appendMessage('bot', html);
               }
               scrollBottom();
+              // Initialise Chart.js after the canvas is in the DOM
+              if (evt.data.type === 'chart' && evt.data._canvasId) {
+                initChart(evt.data._canvasId, evt.data);
+              }
             }
             // If no data, streamBubble already holds the complete streamed text
           }
@@ -211,6 +315,13 @@
 
   document.querySelectorAll('.quick-btn[data-msg]').forEach(btn => {
     btn.addEventListener('click', () => sendMessage(btn.dataset.msg));
+  });
+
+  // ── suggestion buttons (dynamically injected into chat bubbles) ───────────
+
+  messagesEl.addEventListener('click', e => {
+    const btn = e.target.closest('[data-suggest]');
+    if (btn) sendMessage(btn.dataset.suggest);
   });
 
   // ── reload PDFs (admin) ───────────────────────────────────────────────────
