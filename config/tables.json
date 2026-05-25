@@ -1,0 +1,8 @@
+{
+  "employees":       "employees",
+  "products":        "products",
+  "sales":           "sales",
+  "attendance":      "attendance",
+  "stock_movement":  "tstock_movement",
+  "user_stock":      "tuser_stock"
+}
