@@ -1,6 +1,8 @@
 # Company ChatBot
 
-A Python web chatbot powered by **open-source LLMs via Ollama** that intelligently routes queries across multiple data sources — MySQL databases, a ChromaDB vector store, and a PDF knowledge library — through a single natural-language chat interface.
+A Python web chatbot powered by **LangGraph ReAct agent** that intelligently routes queries across multiple data sources — MySQL or PostgreSQL databases, a ChromaDB vector store, and a PDF knowledge library — through a single natural-language interface.
+
+Multi-database support is fully **configuration-driven**: switch between MySQL and PostgreSQL by changing one environment variable, with no code changes required.
 
 ---
 
@@ -8,116 +10,115 @@ A Python web chatbot powered by **open-source LLMs via Ollama** that intelligent
 
 | Feature | Description |
 |---|---|
-| **Product Sales** | Ask about monthly sales for any product; the LLM queries MySQL and returns a formatted table |
-| **PDF Q&A** | Ask any question; the LLM searches all PDFs via semantic vector similarity (ChromaDB + sentence-transformers) |
-| **Attendance – Employee** | Type *"Check in"* or *"Check out"* to record daily attendance |
-| **Attendance – Admin** | Admins can ask to see all employees' attendance history |
-| **Smart Routing** | The LLM autonomously decides which database(s) to query based on the message; no keyword rules needed |
-| **Open Source** | Runs entirely locally — Ollama for the LLM, ChromaDB for vector search, MySQL for structured data |
+| **Dynamic SQL** | LLM writes arbitrary SELECT queries including JOINs, aggregations, rankings, and date filters |
+| **Multi-Database** | MySQL and PostgreSQL supported; swap with `DB_TYPE` in `.env` |
+| **Config-Driven Tables** | Table names, relationships, and JOIN hints live in JSON config files — not hardcoded |
+| **Auto JOIN Detection** | LLM is briefed on pre-configured relationships; generates INNER / LEFT / RIGHT JOINs automatically |
+| **PDF Q&A** | Semantic search over uploaded PDFs via ChromaDB + sentence-transformers |
+| **Attendance** | Employee check-in/check-out write; structured attendance history read |
+| **Chart Generation** | LLM fetches data then calls `generate_chart` to render Chart.js bar / line / pie / doughnut |
+| **Response Accuracy** | Every bot message shows a confidence % based on query success, data completeness, and tool outcomes |
+| **Multi-LLM** | Supports Ollama, OpenAI, Anthropic, and Groq via a single `.env` setting |
 
 ---
 
 ## Architecture
 
+### File structure
+
 ```
 chat-bot/
-├── app.py               # Flask web server & API routes
-├── chatbot.py           # LangChain tool-calling agent (multi-DB routing)
-├── database.py          # MySQL connection pool + all queries
-├── pdf_handler.py       # PDF loading, chunking, ChromaDB vector search
-├── config.py            # Env-based configuration
-├── schema.sql           # DB schema + comprehensive seed data
+├── app.py                    # Flask server — auth, routes, SSE streaming
+├── chatbot.py                # LangGraph ReAct agent, tools, confidence tracker
+├── database.py               # Adapter-agnostic DB operations (attendance, auth)
+├── pdf_handler.py            # PDF loading, chunking, ChromaDB vector search
+├── config.py                 # Env + JSON config loader; LLM factory
+│
+├── config/                   # ← Configuration files (edit without touching code)
+│   ├── database.json         #   Connection pool settings
+│   ├── tables.json           #   Logical → actual table name mappings
+│   └── relationships.json    #   JOIN relationship definitions
+│
+├── db/                       # ← Database adapter layer
+│   ├── adapter.py            #   Abstract base (execute / execute_write / sanitize)
+│   ├── mysql_adapter.py      #   MySQL  (mysql+mysqlconnector)
+│   ├── postgresql_adapter.py #   PostgreSQL (postgresql+psycopg2)
+│   └── factory.py            #   Singleton factory — reads DB_TYPE from .env
+│
+├── schema.sql                # MySQL schema + seed data
 ├── requirements.txt
 ├── .env.example
-├── pdfs/                # Drop PDF files here
-├── chroma_db/           # ChromaDB vector store (auto-created, gitignored)
+├── pdfs/                     # Drop PDF files here
+├── chroma_db/                # ChromaDB vector store (auto-created, gitignored)
 ├── templates/
 │   ├── base.html
 │   ├── login.html
-│   └── index.html       # Main chat UI
+│   └── index.html            # Main chat UI
 └── static/
     ├── css/style.css
     └── js/chat.js
 ```
 
-### Component Diagram
+### Request flow
 
 ```
-Browser (chat UI)
-      │  HTTP POST /api/chat
-      ▼
-┌─────────────┐
-│   app.py    │  Flask – auth, routing, session
-└──────┬──────┘
-       │
-       ▼
-┌─────────────────────────────────────────────────┐
-│                  chatbot.py                     │
-│                                                 │
-│  LangChain AgentExecutor                        │
-│  + ChatOllama (llama3.1 via Ollama)             │
-│                                                 │
-│  LLM reads the user message and calls one or   │
-│  more tools to fetch data, then composes a     │
-│  natural-language response.                    │
-└────┬──────────────┬──────────────┬──────────────┘
-     │              │              │
-     ▼              ▼              ▼
-┌──────────┐  ┌──────────┐  ┌─────────────────┐
-│database  │  │database  │  │  pdf_handler.py  │
-│.py       │  │.py       │  │                  │
-│(sales /  │  │(attend-  │  │  ChromaDB +      │
-│products) │  │ance)     │  │  sentence-trans- │
-└────┬─────┘  └────┬─────┘  │  formers embed-  │
-     │              │        │  dings           │
-     ▼              ▼        └────────┬─────────┘
-  MySQL DB                            │
-┌──────────┐ ┌──────────┐             ▼
-│ products │ │  sales   │       chroma_db/
-│ employees│ │attendance│   (persisted vectors)
-└──────────┘ └──────────┘
+Browser
+  │  POST /api/chat  (NDJSON stream)
+  ▼
+app.py  ──────────────────────────────────────────────────────
+  │  stream_message(message, user)
+  ▼
+chatbot.py  (LangGraph ReAct agent)
+  │
+  │  builds system prompt dynamically from:
+  │    config/tables.json        ← actual table names
+  │    config/relationships.json ← JOIN hints for LLM
+  │    DB dialect                ← MySQL vs PostgreSQL date functions
+  │
+  ├─ tool: sql_query      → LangChain SQLDatabase → MySQL / PostgreSQL
+  ├─ tool: sql_schema     → table column info
+  ├─ tool: search_pdf_library → ChromaDB (pdfs/)
+  ├─ tool: mark_attendance    → database.py → adapter → DB (write)
+  ├─ tool: get_attendance_report → database.py → adapter → DB (read)
+  └─ tool: generate_chart → Chart.js JSON payload
+  │
+  │  _ConfidenceTracker tallies tool outcomes throughout
+  ▼
+NDJSON events:  {"status":"…"} | {"token":"…"} | {"done":true,"confidence":87}
+  ▼
+chat.js renders tokens live, then appends "● Response Accuracy: 87%" footer
 ```
 
-### Multi-Database Routing via LangChain Tool Use
-
-The LLM is given five tools, one per data source. It reads the user's intent and selects the right tool(s) automatically — no keyword rules, no regex, no hardcoded routing.
+### Database adapter layer
 
 ```
-User message
-    │
-    ▼
-ChatOllama (llama3.1)
-    │
-    ├─ sales / revenue / earnings?     → tool: query_product_sales  → MySQL sales
-    ├─ which products exist?           → tool: list_products         → MySQL products
-    ├─ company policy / manual / spec? → tool: search_pdf_library    → ChromaDB (PDFs)
-    ├─ check in / arriving?            → tool: mark_attendance       → MySQL attendance (write)
-    └─ show attendance / history?      → tool: get_attendance_report → MySQL attendance (read)
-
-The LLM may call multiple tools in a single response when a question
-spans several data sources (e.g. "compare Laptop Pro sales with our
-return policy").
+db/factory.py  reads DB_TYPE from .env
+  │
+  ├─ DB_TYPE=mysql        → MySQLAdapter       (mysql+mysqlconnector URI)
+  └─ DB_TYPE=postgresql   → PostgreSQLAdapter  (postgresql+psycopg2 URI)
+       ↓ both extend DatabaseAdapter
+         .execute(query, params)       → list[dict]  (sanitised)
+         .execute_write(query, params) → None
+         .dialect_name                 → 'mysql' | 'postgresql'
+         .date_functions               → dialect date hints injected into LLM prompt
 ```
 
-### PDF Semantic Search Pipeline
+All queries use `SQLAlchemy text()` with `:named` parameters — compatible with every supported dialect. Table names are injected from `config/tables.json` (trusted source), never from user input.
 
-1. On startup, `pdf_handler.load_pdfs()` reads every `.pdf` in `pdfs/`
-2. Each PDF is split into ~600-character sentence-aware chunks
-3. Chunks are embedded using `all-MiniLM-L6-v2` (sentence-transformers, ~80 MB, downloads once)
-4. Embeddings are stored in a local **ChromaDB** persistent collection
-5. On a query, the question is embedded and the top-K most similar chunks are retrieved via cosine similarity
-6. The LLM receives the chunks and cites the source filename in its response
+### Confidence scoring
 
-ChromaDB persists embeddings to `chroma_db/` — after the first run, restarts are instant.
+`_ConfidenceTracker` starts each turn at **85 %** and adjusts based on evidence:
 
-### Database Schema
+| Event | Δ Score |
+|---|---|
+| SQL returns rows | +5 |
+| SQL returns empty result | −20 |
+| SQL error | −35 |
+| PDF chunks found (avg relevance r) | +(r−0.5)×12 |
+| PDF not found | −15 |
+| Attendance / write tool fails | −10 |
 
-```sql
-employees   (employee_id, username, password, name, email, department, role)
-products    (product_id, name, category, price, description)
-sales       (sale_id, product_id, quantity, amount, sale_date, customer_name)
-attendance  (attendance_id, employee_id, date, check_in, check_out, status)
-```
+Score is clamped to **[10, 98]**. Colour coding in the UI: green ≥ 80 %, amber 55–79 %, red < 55 %.
 
 ---
 
@@ -125,10 +126,9 @@ attendance  (attendance_id, employee_id, date, check_in, check_out, status)
 
 | Tool | Minimum version | Notes |
 |---|---|---|
-| Python | 3.11 | |
-| MySQL | 8.0 | |
-| pip | 23 | |
-| Ollama | latest | Install from https://ollama.com |
+| Python | 3.10 | |
+| MySQL **or** PostgreSQL | 8.0 / 14 | Only one needed |
+| Ollama | latest | Required for `LLM_PROVIDER=ollama` |
 
 ---
 
@@ -145,10 +145,8 @@ cd chat-bot
 
 ```bash
 python -m venv venv
-# Linux / macOS
-source venv/bin/activate
-# Windows
-venv\Scripts\activate
+source venv/bin/activate       # Linux / macOS
+# venv\Scripts\activate        # Windows
 ```
 
 ### 3. Install dependencies
@@ -157,60 +155,209 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-> **Note:** `sentence-transformers` will download the `all-MiniLM-L6-v2` model (~80 MB) on first run.
+> `sentence-transformers` downloads `all-MiniLM-L6-v2` (~80 MB) on first run.  
+> `psycopg2-binary` is included for PostgreSQL; it is unused if you stay on MySQL.
 
-### 4. Install Ollama and pull a model
-
-```bash
-# Install Ollama — https://ollama.com/download
-# Linux one-liner:
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull the default model (requires ~4 GB disk space)
-ollama pull llama3.1
-
-# Optional: use a smaller/faster model
-# ollama pull qwen2.5:7b
-```
-
-> **Model requirements:** The model must support native tool calling. Confirmed working: `llama3.1`, `qwen2.5`, `mistral-nemo`. Set `LLM_MODEL` in `.env` to switch models.
-
-### 5. Configure environment
+### 4. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials:
+Edit `.env` — minimum required fields:
 
+**MySQL:**
 ```env
-# MySQL
+DB_TYPE=mysql
 DB_HOST=localhost
 DB_USER=root
 DB_PASSWORD=your_password
 DB_NAME=chatbot_db
-
-# Ollama
-OLLAMA_HOST=http://localhost:11434
-LLM_MODEL=llama3.1
-
-# Flask
+DB_PORT=3306
 SECRET_KEY=replace-with-a-long-random-string
 ```
 
-### 6. Set up the database
+**PostgreSQL:**
+```env
+DB_TYPE=postgresql
+DB_HOST=localhost
+DB_USER=postgres
+DB_PASSWORD=your_password
+DB_NAME=chatbot_db
+DB_PORT=5432
+DB_SCHEMA=public          # optional
+SECRET_KEY=replace-with-a-long-random-string
+```
 
+### 5. Set up the database
+
+**MySQL:**
 ```bash
 mysql -u root -p < schema.sql
 ```
 
-This creates the `chatbot_db` database, all tables, and comprehensive seed data including:
-- **7 employees** — 1 admin + 6 employees across Sales, HR, Marketing, Engineering, Finance
-- **12 products** — Electronics and Furniture categories
-- **~46 sales records** — spread across current month, previous month, and two months ago
-- **~59 attendance records** — 14 days of history for all 6 non-admin employees
+**PostgreSQL:**  
+The `schema.sql` file uses MySQL syntax. For PostgreSQL, create the database manually and adapt the DDL (replace `AUTO_INCREMENT` with `SERIAL`, `ENUM` with `VARCHAR`, etc.) or use a migration tool such as pgloader.
 
-Seed accounts:
+### 6. Choose an LLM provider
+
+**Ollama (default — runs locally):**
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llama3.1
+pip install -r requirements-ollama.txt
+```
+
+**Groq (cloud, fast, recommended for testing):**
+```bash
+pip install -r requirements-groq.txt
+# In .env:
+LLM_PROVIDER=groq
+LLM_MODEL=llama-3.1-8b-instant
+LLM_API_KEY=your_groq_key
+```
+
+**OpenAI:**
+```bash
+pip install -r requirements-openai.txt
+# In .env:
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4o-mini
+LLM_API_KEY=sk-...
+```
+
+**Anthropic:**
+```bash
+pip install -r requirements-anthropic.txt
+# In .env:
+LLM_PROVIDER=anthropic
+LLM_MODEL=claude-sonnet-4-6
+LLM_API_KEY=sk-ant-...
+```
+
+### 7. Add PDF files (optional)
+
+```bash
+cp ~/my-documents/*.pdf pdfs/
+```
+
+PDFs are indexed automatically on startup. Use the **Reload PDFs** button in the UI (admin only) after adding new files.
+
+### 8. Run the application
+
+```bash
+python app.py
+```
+
+Open **http://localhost:5000** — log in with `admin / admin123` or `john.doe / password123`.
+
+---
+
+## Configuration Files
+
+### `config/tables.json` — table name mappings
+
+Maps logical names used in code to actual database table names. Rename or alias tables here without touching any Python.
+
+```json
+{
+  "employees":      "employees",
+  "products":       "products",
+  "sales":          "sales",
+  "attendance":     "attendance",
+  "stock_movement": "tstock_movement",
+  "user_stock":     "tuser_stock"
+}
+```
+
+The chatbot's system prompt and `SQLDatabase.include_tables` are both built from this file at startup.
+
+### `config/relationships.json` — JOIN definitions
+
+Tells the LLM which tables are related and how to join them. The agent uses these as starting-point hints when a query spans multiple tables.
+
+```json
+{
+  "relationships": [
+    {
+      "left_table":  "sales",
+      "right_table": "products",
+      "left_key":    "product_id",
+      "right_key":   "product_id",
+      "join_type":   "INNER"
+    },
+    {
+      "left_table":  "attendance",
+      "right_table": "employees",
+      "left_key":    "employee_id",
+      "right_key":   "employee_id",
+      "join_type":   "INNER"
+    }
+  ]
+}
+```
+
+Supported `join_type` values: `INNER`, `LEFT`, `RIGHT`.
+
+#### Auto-generation (hybrid)
+
+`relationships.json` is **automatically updated on every startup** via `config.sync_relationships()`, which is called from `app.py`. It uses a hybrid strategy:
+
+| Source | How it works |
+|---|---|
+| **FK-discovered** | Queries `INFORMATION_SCHEMA` (MySQL) or `information_schema` (PostgreSQL) for declared foreign key constraints. Each FK becomes an `INNER` JOIN entry. |
+| **Manual / logical** | Any entry already in `relationships.json` that has no matching FK constraint is kept unchanged. Use this for joins on shared columns that lack a formal FK (e.g. `tstock_movement.imei → tuser_stock.imei1`). |
+| **Conflict resolution** | If a FK-discovered relationship already exists in the file, the **file version wins** — preserving any custom `join_type` you have set. |
+
+If the database is unreachable at startup, auto-sync is skipped with a warning log and the existing file is used unchanged.
+
+**To add a logical relationship** (no FK in the schema), just append it to `relationships.json` manually — it will survive future auto-syncs:
+
+```json
+{
+  "left_table":  "tstock_movement",
+  "right_table": "tuser_stock",
+  "left_key":    "imei",
+  "right_key":   "imei1",
+  "join_type":   "LEFT"
+}
+```
+
+### `config/database.json` — connection pool settings
+
+```json
+{
+  "pool_size":    5,
+  "max_overflow": 10,
+  "pool_recycle": 1800,
+  "pool_timeout": 30
+}
+```
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_TYPE` | `mysql` | Database engine: `mysql` \| `postgresql` |
+| `DB_HOST` | `localhost` | Database host |
+| `DB_USER` | `root` | Database username |
+| `DB_PASSWORD` | _(empty)_ | Database password |
+| `DB_NAME` | `chatbot_db` | Database / catalog name |
+| `DB_PORT` | `3306` | Port (`5432` for PostgreSQL) |
+| `DB_SCHEMA` | _(none)_ | PostgreSQL schema (sets `search_path`) |
+| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `anthropic` \| `groq` |
+| `LLM_MODEL` | `llama3.1` | Provider-specific model name |
+| `LLM_API_KEY` | _(empty)_ | Required for cloud providers |
+| `LLM_BASE_URL` | _(empty)_ | Ollama URL or custom OpenAI-compatible endpoint |
+| `PDF_DIR` | `./pdfs` | Directory scanned for PDF files |
+| `CHROMA_DIR` | `./chroma_db` | ChromaDB persistence directory |
+| `SECRET_KEY` | _(insecure)_ | Flask session secret — **change in production** |
+
+---
+
+## Seed Accounts
 
 | Username | Password | Role | Department |
 |---|---|---|---|
@@ -222,78 +369,33 @@ Seed accounts:
 | `charlie.davis` | `password123` | employee | Engineering |
 | `diana.wilson` | `password123` | employee | Finance |
 
-### 7. Add PDF files (optional)
-
-Copy any `.pdf` files into the `pdfs/` directory:
-
-```bash
-cp ~/my-documents/*.pdf pdfs/
-```
-
-PDFs are indexed automatically on startup. Use the **Reload PDFs** button in the UI (admin only) to re-index after adding new files.
-
-### 8. Start Ollama (if not already running)
-
-```bash
-ollama serve
-```
-
-> Ollama runs as a background service automatically on most installs. Check with `ollama list`.
-
-### 9. Run the application
-
-```bash
-python app.py
-```
-
-Open your browser at **http://localhost:5000**
-
 ---
 
 ## Usage Examples
 
-### Product Sales
-
+**Dynamic SQL with JOINs**
 ```
-You:  Show sales for Laptop Pro
-Bot:  [table: Product | Units Sold | Revenue | Transactions]
+You:  Show top 5 products by revenue this month
+Bot:  [table] — LLM writes: SELECT p.name, SUM(s.amount) … JOIN … GROUP BY … ORDER BY … LIMIT 5
 
-You:  What are last month's earnings for Monitor 4K?
-Bot:  [table with previous month figures]
+You:  Show a bar chart of sales by category
+Bot:  [Chart.js bar chart rendered inline]
 ```
 
-### PDF Questions
-
+**PDF Q&A**
 ```
 You:  What is the return policy?
-Bot:  According to company-policy.pdf: Customers may return products
-      within 30 days of purchase...
+Bot:  According to policy.pdf: Returns accepted within 30 days…
+      Response Accuracy: 91%
 ```
 
-### Attendance
-
+**Attendance**
 ```
 You:  Check in
-Bot:  Check-in recorded at 09:02:14.
+Bot:  Check-in marked at 09:02:14.   ● Response Accuracy: 88%
 
-You:  Check out
-Bot:  Check-out recorded at 17:45:33.
-```
-
-### Admin – View All Attendance
-
-```
-You:  Show all attendance
+You:  Show all attendance    (admin only)
 Bot:  [table: Name | Dept | Date | Check-in | Check-out | Status]
-```
-
-### Multi-source query
-
-```
-You:  What does the warranty policy say, and how many warranties
-      were sold last month?
-Bot:  [calls search_pdf_library AND query_product_sales, then
-       combines both answers in a single response]
 ```
 
 ---
@@ -302,64 +404,180 @@ Bot:  [calls search_pdf_library AND query_product_sales, then
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `POST` | `/api/chat` | session | Send a chat message |
-| `GET`  | `/api/pdfs` | session | List loaded PDF files |
+| `POST` | `/api/chat` | session | Send a chat message (NDJSON stream) |
+| `GET`  | `/api/pdfs` | session | List loaded PDF filenames |
 | `POST` | `/api/reload-pdfs` | admin | Re-scan `pdfs/` and rebuild ChromaDB index |
 | `POST` | `/login` | — | Authenticate |
 | `GET`  | `/logout` | — | Clear session |
 
-### `/api/chat` – Request
+### `/api/chat` NDJSON event types
 
-```json
-{ "message": "Show sales for Laptop Pro" }
+```jsonc
+{"status": "Running Sql Query…"}          // tool running indicator
+{"token": "Here are the top…"}            // streamed text token
+{"done": true, "confidence": 87}          // text response complete
+{"done": true, "data": {…}, "confidence": 92}  // structured response
 ```
 
-### `/api/chat` – Response types
+Structured `data` types: `chart`, `attendance_table`, `attendance`, `error`.
 
-**Text**
-```json
-{ "type": "text", "message": "..." }
+---
+
+## QueryBuilder
+
+`db/query_builder.py` provides a chainable, dialect-aware programmatic query builder for use in application code (not for the LLM — the agent writes raw SQL). It produces `SQLAlchemy text()`-compatible parameterized queries that work on both MySQL and PostgreSQL.
+
+### Chaining API
+
+| Method | Purpose |
+|---|---|
+| `.select(*cols)` | Add columns or expressions |
+| `.count/sum/avg/min/max(col, alias=)` | Add aggregate functions |
+| `.join(table, on=, join_type=)` | Generic JOIN |
+| `.inner_join(table, on=)` | INNER JOIN shorthand |
+| `.left_join(table, on=)` | LEFT JOIN shorthand |
+| `.right_join(table, on=)` | RIGHT JOIN shorthand |
+| `.where(condition, **params)` | Add WHERE condition (AND-chained) |
+| `.group_by(*cols)` | GROUP BY columns |
+| `.having(condition, **params)` | HAVING condition (AND-chained) |
+| `.order_by(col, desc=False)` | ORDER BY — pass `desc=True` or include `DESC` in the string |
+| `.limit(n)` | LIMIT |
+| `.offset(n)` | OFFSET |
+| `.paginate(page, page_size)` | Sets LIMIT + OFFSET for a 1-based page number |
+| `.build()` | Returns `(sql_string, params_dict)` |
+| `.execute()` | Builds and runs via the active adapter; returns `list[dict]` |
+
+### Dialect-aware date helpers (static methods)
+
+| Method | MySQL output | PostgreSQL output |
+|---|---|---|
+| `QueryBuilder.month_of('col')` | `MONTH(col)` | `EXTRACT(MONTH FROM col)` |
+| `QueryBuilder.year_of('col')` | `YEAR(col)` | `EXTRACT(YEAR FROM col)` |
+| `QueryBuilder.current_date()` | `CURDATE()` | `CURRENT_DATE` |
+| `QueryBuilder.current_timestamp()` | `NOW()` | `NOW()` |
+| `QueryBuilder.date_sub_days(7)` | `DATE_SUB(CURDATE(), INTERVAL 7 DAY)` | `(CURRENT_DATE - INTERVAL '7 days')` |
+| `QueryBuilder.date_trunc_month('col')` | `DATE_FORMAT(col, '%Y-%m-01')` | `DATE_TRUNC('month', col)` |
+
+### Examples
+
+**Simple SELECT with filter, sort, limit**
+```python
+from db.query_builder import QueryBuilder
+
+sql, params = (
+    QueryBuilder("products")
+    .select("name", "category", "price")
+    .where("category = :cat", cat="Electronics")
+    .order_by("price", desc=True)
+    .limit(10)
+    .build()
+)
 ```
 
-**Sales table**
-```json
-{
-  "type": "sales_table",
-  "month": "May 2026",
-  "product": "laptop pro",
-  "data": [{ "name": "Laptop Pro", "total_quantity": 10, "total_amount": 9999.90, "total_transactions": 3 }]
-}
+**JOIN + aggregation + HAVING**
+```python
+results = (
+    QueryBuilder("sales s")
+    .select("p.name")
+    .sum("s.amount", alias="revenue")
+    .count("*",      alias="transactions")
+    .inner_join("products p", on="s.product_id = p.product_id")
+    .where(f"{QueryBuilder.month_of('s.sale_date')} = :m", m=5)
+    .group_by("p.product_id", "p.name")
+    .having("SUM(s.amount) > :min", min=500)
+    .order_by("revenue", desc=True)
+    .limit(5)
+    .execute()
+)
 ```
 
-**Attendance table**
-```json
-{
-  "type": "attendance_table",
-  "data": [{ "name": "John Doe", "department": "Sales", "date": "2026-05-03", "check_in": "09:01:00", "check_out": "17:30:00", "status": "present" }]
-}
+**Pagination**
+```python
+page_2 = (
+    QueryBuilder("employees")
+    .select("name", "department", "role")
+    .order_by("name")
+    .paginate(page=2, page_size=20)
+    .execute()
+)
 ```
 
-**Attendance action**
-```json
-{ "type": "attendance", "status": "success", "message": "Check-in marked at 09:01:00." }
+**LEFT JOIN with multiple WHERE conditions**
+```python
+sql, params = (
+    QueryBuilder("tstock_movement sm")
+    .select("sm.imei", "sm.status", "us.model_name")
+    .left_join("tuser_stock us", on="sm.imei = us.imei1")
+    .where("sm.status = :status", status="sold")
+    .where("sm.movement_type = :mtype", mtype="outbound")
+    .order_by("sm.moved_date", desc=True)
+    .limit(20)
+    .build()
+)
 ```
 
 ---
 
-## Environment Variables
+## Adding a New Database Engine
 
-| Variable | Default | Description |
-|---|---|---|
-| `DB_HOST` | `localhost` | MySQL host |
-| `DB_USER` | `root` | MySQL username |
-| `DB_PASSWORD` | _(empty)_ | MySQL password |
-| `DB_NAME` | `chatbot_db` | Database name |
-| `DB_PORT` | `3306` | MySQL port |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
-| `LLM_MODEL` | `llama3.1` | Ollama model name (must support tool calling) |
-| `PDF_DIR` | `./pdfs` | Path to PDF directory |
-| `CHROMA_DIR` | `./chroma_db` | Path where ChromaDB persists embeddings |
-| `SECRET_KEY` | _(insecure default)_ | Flask session secret — **change in production** |
+1. **Create an adapter** in `db/`:
+
+```python
+# db/mssql_adapter.py
+from urllib.parse import quote_plus
+from .adapter import DatabaseAdapter
+
+class MSSQLAdapter(DatabaseAdapter):
+    def __init__(self, host, port, user, password, database, **_):
+        ...
+
+    def get_uri(self) -> str:
+        return f"mssql+pymssql://{quote_plus(self.user)}:{quote_plus(self.password)}@{self.host}:{self.port}/{self.database}"
+
+    @property
+    def dialect_name(self) -> str:
+        return "mssql"
+
+    @property
+    def date_functions(self) -> dict:
+        return {
+            "current_date":      "CAST(GETDATE() AS DATE)",
+            "current_timestamp": "GETDATE()",
+            "month_extract":     "MONTH({col})",
+            "year_extract":      "YEAR({col})",
+            "date_sub_days":     "DATEADD(day, -{n}, CAST(GETDATE() AS DATE))",
+            "date_trunc_month":  "DATEFROMPARTS(YEAR({col}), MONTH({col}), 1)",
+        }
+```
+
+2. **Register it** in `db/factory.py`:
+
+```python
+elif db_type == "mssql":
+    port = int(os.getenv("DB_PORT", 1433))
+    from .mssql_adapter import MSSQLAdapter
+    _adapter = MSSQLAdapter(host=host, port=port, user=user, password=password, database=database)
+```
+
+3. **Install the driver**: add `pymssql` to `requirements.txt`.
+
+4. **Set `.env`**: `DB_TYPE=mssql` — no other code changes needed.
+
+---
+
+## Adding Tables or Renaming Existing Ones
+
+1. Edit `config/tables.json` — add or rename any entry:
+
+```json
+{
+  "invoices": "tbl_invoices_2024"
+}
+```
+
+2. Optionally add JOIN relationships to `config/relationships.json`.
+
+3. Restart the application — the LLM system prompt and `SQLDatabase` table list both update automatically.
 
 ---
 
@@ -367,20 +585,20 @@ Bot:  [calls search_pdf_library AND query_product_sales, then
 
 | Role | Capabilities |
 |---|---|
-| `employee` | Chat, product sales queries, PDF Q&A, own check-in/check-out, own attendance history |
-| `admin` | All employee capabilities + view **all** employees' attendance + reload PDF library |
+| `employee` | Chat, any SQL query, PDF Q&A, own check-in/check-out, own attendance history |
+| `admin` | All employee capabilities + view all employees' attendance + reload PDF library |
 
 ---
 
-## Production Notes
+## Production Checklist
 
-- Set `debug=False` in `app.py` (or use `gunicorn app:app`)
-- Use a strong, random `SECRET_KEY`
-- Run MySQL with a dedicated user and restricted privileges
-- Place the app behind a reverse proxy (nginx) with HTTPS
-- The `chroma_db/` directory is a generated artifact — back it up or rebuild from PDFs
-- To force a full re-index of PDFs, delete `chroma_db/` and restart (or use the Reload PDFs API)
-- Ollama runs on the same host by default; set `OLLAMA_HOST` to point to a remote Ollama instance
+- Set `debug=False` in `app.py` or run with `gunicorn app:app -w 4`
+- Use a strong random `SECRET_KEY`
+- Create a dedicated DB user with `SELECT` only (plus `INSERT/UPDATE` on the attendance table)
+- Place the app behind nginx / Caddy with HTTPS
+- Back up or persist `chroma_db/` — delete it to force a full PDF re-index
+- For PostgreSQL: tune `pool_size` and `pool_recycle` in `config/database.json` to match your server's `max_connections`
+- Set `LOG_LEVEL=WARNING` via `logging.basicConfig` in production to reduce log volume
 
 ---
 
@@ -389,12 +607,13 @@ Bot:  [calls search_pdf_library AND query_product_sales, then
 | Layer | Technology |
 |---|---|
 | Web framework | Flask 3 |
-| LLM | Ollama (local) — default model: `llama3.1` |
-| Agent framework | LangChain (`create_tool_calling_agent` + `AgentExecutor`) |
-| LLM integration | `langchain-ollama` (`ChatOllama`) |
-| Database | MySQL 8 + mysql-connector-python |
+| Agent framework | LangGraph (`create_react_agent`) |
+| LLM integrations | ChatOllama, ChatOpenAI, ChatAnthropic, ChatGroq |
+| DB abstraction | SQLAlchemy 2 + custom adapter pattern |
+| MySQL driver | mysql-connector-python |
+| PostgreSQL driver | psycopg2-binary |
 | Vector store | ChromaDB (local persistent) |
 | Embeddings | sentence-transformers `all-MiniLM-L6-v2` |
 | PDF parsing | PyPDF2 |
-| Frontend | Vanilla JS + CSS (no framework) |
+| Frontend | Vanilla JS + CSS, Chart.js 4.4 |
 | Auth | Flask sessions + SHA-256 password hashing |

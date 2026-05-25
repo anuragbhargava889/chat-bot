@@ -211,6 +211,19 @@ html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; font-
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
 
+/* ── Response accuracy footer ────────────────────────────────────────────── */
+.response-accuracy {
+  margin-top: .6rem;
+  padding-top: .45rem;
+  border-top: 1px solid var(--border);
+  font-size: .75rem;
+  color: var(--muted);
+  text-align: right;
+}
+.accuracy-high { color: var(--success); }
+.accuracy-mid  { color: var(--warn);    }
+.accuracy-low  { color: var(--danger);  }
+
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media (max-width: 640px) {
   .sidebar { display: none; }

@@ -167,7 +167,7 @@
         `<tr>
           <td>${escHtml(r.name)}</td>
           <td>${escHtml(String(r.total_quantity))}</td>
-          <td>$${parseFloat(r.total_amount).toFixed(2)}</td>
+          <td>${CURRENCY}${parseFloat(r.total_amount).toFixed(2)}</td>
           <td>${escHtml(String(r.total_transactions))}</td>
         </tr>`
       ).join('');
@@ -271,20 +271,31 @@
 
           } else if (evt.done !== undefined) {
             clearTyping();
+            let activeBubble = streamBubble;
             if (evt.data) {
               // Structured response (chart, table, attendance, error, or text after tool use)
               const html = renderResponse(evt.data);
               if (streamBubble) {
                 streamBubble.querySelector('.bubble').innerHTML = html;
               } else {
-                appendMessage('bot', html);
+                activeBubble = appendMessage('bot', html);
               }
-              scrollBottom();
               // Initialise Chart.js after the canvas is in the DOM
               if (evt.data.type === 'chart' && evt.data._canvasId) {
                 initChart(evt.data._canvasId, evt.data);
               }
             }
+            // Append confidence footer to every bot response
+            if (activeBubble && evt.confidence !== undefined) {
+              const bubbleEl = activeBubble.querySelector('.bubble');
+              const footer   = document.createElement('div');
+              footer.className = 'response-accuracy';
+              const score = evt.confidence;
+              const cls   = score >= 80 ? 'accuracy-high' : score >= 55 ? 'accuracy-mid' : 'accuracy-low';
+              footer.innerHTML = `<span class="${cls}">&#11044;</span> Response Accuracy: <strong>${score}%</strong>`;
+              bubbleEl.appendChild(footer);
+            }
+            scrollBottom();
             // If no data, streamBubble already holds the complete streamed text
           }
         }

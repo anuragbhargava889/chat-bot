@@ -1,13 +1,28 @@
 import hashlib
+import logging
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 
 from chatbot import stream_message
-from config import SECRET_KEY
+from config import SECRET_KEY, CURRENCY_SYMBOL
 from database import get_employee_by_username
 from pdf_handler import get_pdf_list, load_pdfs
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
+
+# Auto-sync FK relationships from the live DB schema at startup.
+# Falls back silently to the existing relationships.json if the DB is not yet reachable.
+try:
+    from config import sync_relationships
+    sync_relationships()
+except Exception as _sync_exc:
+    logger.warning("Relationship auto-sync skipped: %s", _sync_exc)
 app.secret_key = SECRET_KEY
 
 
@@ -41,7 +56,7 @@ def index():
     redir = _require_login()
     if redir:
         return redir
-    return render_template("index.html", user=_current_user())
+    return render_template("index.html", user=_current_user(), currency=CURRENCY_SYMBOL)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -65,7 +80,7 @@ def login():
             return redirect(url_for("index"))
         error = "Invalid username or password."
 
-    return render_template("login.html", error=error)
+    return render_template("login.html", error=error, currency=CURRENCY_SYMBOL)
 
 
 @app.route("/logout")

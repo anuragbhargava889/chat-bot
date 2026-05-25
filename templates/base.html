@@ -6,6 +6,7 @@
   <title>{% block title %}ChatBot{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script>const CURRENCY = {{ currency | tojson }};</script>
 </head>
 <body>
   {% block content %}{% endblock %}

@@ -1,20 +1,21 @@
-"""
-Chatbot core — LangGraph ReAct agent + LangChain SQLDatabase.
+"""Chatbot core — LangGraph ReAct agent + LangChain SQLDatabase.
 
-Two entry points:
-  process_message() → dict          (kept for compatibility)
-  stream_message()  → NDJSON events (used by the SSE endpoint)
+Entry points:
+  stream_message()  → NDJSON events (SSE endpoint)
+  process_message() → dict (synchronous, kept for compatibility)
 
 Tools:
-  sql_query             → Dynamic SELECT on all tables (LangChain SQLDatabase)
-  sql_schema            → Table schema / column introspection
-  search_pdf_library    → ChromaDB vector store (PDFs)
-  mark_attendance       → Attendance write — controlled, structured response
-  get_attendance_report → Attendance read  — structured response
+  sql_query             — Dynamic SELECT on all configured tables
+  sql_schema            — Table schema / column introspection
+  search_pdf_library    — ChromaDB semantic search over PDFs
+  mark_attendance       — Controlled attendance write
+  get_attendance_report — Structured attendance read
+  generate_chart        — Chart.js chart payload generator
 """
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
 
@@ -24,33 +25,112 @@ from langchain_core.tools import StructuredTool, tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, field_validator
 
-from config import get_db_uri, get_llm
+from config import get_db_uri, get_llm, get_table_config, get_relationship_config, get_dialect_hints, DB_TYPE, CURRENCY_SYMBOL
 from database import (
     get_attendance_report as db_get_attendance,
     mark_attendance as db_mark_attendance,
 )
 from pdf_handler import query_pdfs
 
+logger = logging.getLogger(__name__)
 
-# ── System prompt ──────────────────────────────────────────────────────────────
 
-_SYSTEM = """You are a company assistant with access to a MySQL database and PDF library.
+# ── Confidence tracker ─────────────────────────────────────────────────────────
 
-Tables: products(name,category,price), sales(product_id,quantity,amount,sale_date),
-tstock_movement(from_role,to_role,status,movement_type,item_price,sales_price,imei,material_code,dbr_code,moved_date),
-tuser_stock(model_no,model_name,item_main_category,series,imei1,imei2,each_line_item_price,invoice_no,dbr_name,status,quantity,stock_date),
-attendance(employee_id,date,check_in,check_out,status), employees(username,name,email,department,role).
+class _ConfidenceTracker:
+    """Accumulates evidence during a single agent turn to produce a confidence %."""
+
+    def __init__(self):
+        self._score: float = 85.0
+
+    def record_sql(self, result: str) -> None:
+        r = result.strip()
+        if r.startswith("Query error:") or r.startswith("Error:"):
+            self._score -= 35
+            logger.debug("Confidence: SQL error → %.0f", self._score)
+        elif not r or r in ("[]", "None", ""):
+            self._score -= 20
+            logger.debug("Confidence: SQL empty → %.0f", self._score)
+        else:
+            self._score = min(98, self._score + 5)
+            logger.debug("Confidence: SQL data → %.0f", self._score)
+
+    def record_pdf(self, result_json: str) -> None:
+        try:
+            res = json.loads(result_json)
+            if res.get("found") and res.get("chunks"):
+                chunks = res["chunks"]
+                avg_rel = sum(c.get("relevance", 0.5) for c in chunks) / len(chunks)
+                bonus = (avg_rel - 0.5) * 12
+                self._score = min(98, self._score + bonus)
+                logger.debug("Confidence: PDF found (rel=%.2f) → %.0f", avg_rel, self._score)
+            else:
+                self._score -= 15
+                logger.debug("Confidence: PDF not found → %.0f", self._score)
+        except Exception:
+            pass
+
+    def record_tool_success(self, success: bool) -> None:
+        if not success:
+            self._score -= 10
+            logger.debug("Confidence: tool fail → %.0f", self._score)
+
+    def get(self) -> int:
+        return round(max(10, min(98, self._score)))
+
+
+# ── System prompt (built dynamically from config) ──────────────────────────────
+
+def _build_system(user_ctx: str) -> str:
+    tables = get_table_config()
+    rels   = get_relationship_config().get("relationships", [])
+
+    # Table descriptions (logical name → actual columns kept fixed; table names from config)
+    tbl_cols = {
+        tables["employees"]:      "username, name, email, department, role",
+        tables["products"]:       "name, category, price",
+        tables["sales"]:          "product_id, quantity, amount, sale_date",
+        tables["attendance"]:     "employee_id, date, check_in, check_out, status",
+        tables["stock_movement"]: "from_role, to_role, status, movement_type, item_price, sales_price, imei, material_code, dbr_code, moved_date",
+        tables["user_stock"]:     "model_no, model_name, item_main_category, series, imei1, imei2, each_line_item_price, invoice_no, dbr_name, status, quantity, stock_date",
+    }
+    tables_str = ", ".join(f"{tbl}({cols})" for tbl, cols in tbl_cols.items())
+
+    # Relationship hints for JOIN queries
+    rel_lines = [
+        f"  - {r['left_table']} {r['join_type']} JOIN {r['right_table']}"
+        f" ON {r['left_table']}.{r['left_key']} = {r['right_table']}.{r['right_key']}"
+        for r in rels
+    ]
+    rel_str = "\n".join(rel_lines) if rel_lines else "  (use sql_schema to discover FK columns)"
+
+    date_hint = get_dialect_hints()
+
+    return f"""You are a company assistant with access to a {DB_TYPE.upper()} database and PDF library.
+
+Tables: {tables_str}
+
+Pre-configured JOIN relationships (use these as a guide — add others as needed):
+{rel_str}
 
 Rules:
-1. Use sql_query for all data questions. SELECT only — never INSERT/UPDATE/DELETE/DROP.
-2. For rankings: ORDER BY … LIMIT N. For dates: MONTH(), YEAR(), DATE_SUB(), CURDATE().
-3. For PDF questions use search_pdf_library and cite the source.
-4. For check-in/out use mark_attendance. For attendance history use get_attendance_report.
-5. For charts: call sql_query first, then generate_chart with the results.
-6. Be concise."""
+1. Use sql_query for all data questions. SELECT / WITH only — never INSERT/UPDATE/DELETE/DROP.
+2. {date_hint}
+3. Rankings: ORDER BY … LIMIT N. Summaries: GROUP BY + aggregate functions.
+4. Multi-table data: write explicit JOIN queries using the relationships above.
+5. For PDF questions use search_pdf_library and cite the source.
+6. For check-in/out use mark_attendance.
+   Use get_attendance_report ONLY for plain "show my attendance" or "show all attendance" with no filters.
+   For ANY filtered attendance query (by date, status, department, name, today, this week, absent, late, etc.)
+   use sql_query — never get_attendance_report.
+7. For charts: call sql_query first, then generate_chart with the results.
+8. Always use {CURRENCY_SYMBOL} as the currency symbol for all monetary values. Never use $.
+9. Be concise.
+
+{user_ctx}"""
 
 
-# ── Fallback suggestions shown when the model fails to parse a query ──────────
+# ── Fallback suggestions ───────────────────────────────────────────────────────
 
 _SUGGESTIONS = [
     "Show top 5 selling products",
@@ -62,7 +142,7 @@ _SUGGESTIONS = [
 ]
 
 
-# ── SQL Database singleton ─────────────────────────────────────────────────────
+# ── SQLDatabase singleton ──────────────────────────────────────────────────────
 
 _sql_db: SQLDatabase | None = None
 
@@ -70,14 +150,13 @@ _sql_db: SQLDatabase | None = None
 def _get_db() -> SQLDatabase:
     global _sql_db
     if _sql_db is None:
+        tables = get_table_config()
         _sql_db = SQLDatabase.from_uri(
             get_db_uri(),
-            include_tables=[
-                "products", "sales", "attendance", "employees",
-                "tstock_movement", "tuser_stock",
-            ],
-            sample_rows_in_table_info=0,  # 0 = columns only, no sample rows → saves ~1000 tokens/call
+            include_tables=list(tables.values()),
+            sample_rows_in_table_info=0,
         )
+        logger.info("SQLDatabase initialised with tables: %s", list(tables.values()))
     return _sql_db
 
 
@@ -93,7 +172,6 @@ def _extract_text(content) -> str:
     return str(content) if content else ""
 
 
-# Llama 3 special tokens that occasionally bleed into streamed output
 _SPECIAL_TOKENS = re.compile(r"<\|[a-zA-Z0-9_]+\|>")
 
 def _clean(text: str) -> str:
@@ -101,29 +179,24 @@ def _clean(text: str) -> str:
 
 
 def _friendly_error(exc: Exception) -> str:
-    """Return a user-facing message for common API errors."""
     s = str(exc)
     if "rate_limit_exceeded" in s or "429" in s:
-        # Extract wait time if present, e.g. "Please try again in 17m11s"
-        import re as _re
-        wait = _re.search(r"try again in ([\w.]+)", s)
+        wait = re.search(r"try again in ([\w.]+)", s)
         wait_msg = f" Please try again in {wait.group(1)}." if wait else " Please try again shortly."
         return f"Rate limit reached for the AI model.{wait_msg}"
     if "failed_generation" in s or "Failed to call a function" in s:
         return (
-            "The model failed to generate a valid tool call for this query. "
-            "Try rephrasing your question or ask for simpler data."
+            "The model failed to generate a valid tool call. "
+            "Try rephrasing or ask for simpler data."
         )
     if "insufficient_quota" in s or "credit" in s.lower():
         return "API credits exhausted. Please top up your account or switch providers in .env."
     if "timeout" in s.lower() or "timed out" in s.lower():
-        return "The request timed out. The model may be overloaded — please try again."
+        return "The request timed out — please try again."
     return f"Error: {exc}"
 
 
-# ── Type coercions ─────────────────────────────────────────────────────────────
-# Different LLMs send tool args as different types (Llama sends strings for
-# booleans and integers). Use str type hints everywhere and coerce at call time.
+# ── Type coercions (Llama sends strings for bool/int/list params) ──────────────
 
 def _to_bool(v) -> bool:
     if isinstance(v, bool):
@@ -149,38 +222,38 @@ def _parse_list(v, cast=str) -> list:
 # ── Tool factory ───────────────────────────────────────────────────────────────
 
 def _make_tools(user: dict | None, db: SQLDatabase) -> list:
-    """Return all agent tools with user context captured in closures."""
 
     @tool
     def sql_query(query: str) -> str:
         """Execute a SQL SELECT query on the business database.
 
-        Use for any data question: product sales, rankings, stock movements, inventory,
-        attendance history, employee data — anything that needs real numbers from the DB.
-
-        Call sql_schema first when unsure about table structure.
-        Use ORDER BY … LIMIT for top-N / bottom-N queries.
-        Use GROUP BY + aggregate functions for summaries and averages.
+        Use for any data question: sales, rankings, stock, inventory, employees.
+        Call sql_schema first when unsure about column names.
+        Use ORDER BY … LIMIT for top-N queries; GROUP BY + aggregates for summaries.
+        Write explicit JOIN queries using the relationships listed in the system prompt.
 
         Args:
             query: A valid SQL SELECT or WITH statement.
         """
         stripped = query.strip()
-        if not (stripped.upper().startswith("SELECT") or stripped.upper().startswith("WITH")):
+        upper = stripped.upper()
+        if not (upper.startswith("SELECT") or upper.startswith("WITH")):
             return "Error: Only SELECT and WITH queries are permitted."
+        logger.info("sql_query: %s", stripped[:200])
         try:
             return db.run(stripped)
         except Exception as exc:
+            logger.warning("sql_query failed: %s", exc)
             return f"Query error: {exc}"
 
     @tool
     def sql_schema(table_names: str = "") -> str:
-        """Get column definitions and sample rows for one or more database tables.
+        """Get column definitions for one or more database tables.
 
-        Always call this before writing queries on unfamiliar tables.
+        Call this before writing queries on unfamiliar tables.
 
         Args:
-            table_names: Comma-separated table names, e.g. 'tstock_movement,tuser_stock'.
+            table_names: Comma-separated table names, e.g. 'sales,products'.
                          Leave empty to get schema for all available tables.
         """
         if table_names.strip():
@@ -192,16 +265,16 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
     def search_pdf_library(question: str, top_k: str = "3") -> str:
         """Semantic search over company PDF documents.
 
-        Use for questions about policies, procedures, warranties, product specifications,
+        Use for questions about policies, procedures, warranties, product specs,
         HR rules, or any knowledge stored in uploaded documents.
 
         Args:
             question: Natural-language question to search for.
-            top_k: Number of document chunks to retrieve (default '3').
+            top_k:    Number of document chunks to retrieve (default '3').
         """
         chunks = query_pdfs(question, top_k=_to_int(top_k, default=3))
         if not chunks:
-            return json.dumps({"found": False, "message": "No relevant content found in the PDF library."})
+            return json.dumps({"found": False, "message": "No relevant content found."})
         return json.dumps({
             "found": True,
             "chunks": [
@@ -214,7 +287,7 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
     def mark_attendance(action: str) -> str:
         """Record the current employee's check-in or check-out.
 
-        Use when the user says they are checking in, arriving, checking out, or leaving.
+        Use when the user says they are checking in/arriving or checking out/leaving.
         Do NOT use sql_query for this — use this tool exclusively.
 
         Args:
@@ -229,60 +302,56 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
 
     @tool
     def get_attendance_report(all_employees: str = "false") -> str:
-        """Retrieve attendance records for structured display.
+        """Retrieve full attendance history for structured table display.
 
-        Employees see their own history. Admins can view all employees.
-        Use this (not sql_query) for attendance history requests.
+        Use ONLY for plain unfiltered requests like "show my attendance" or
+        "show all attendance". This tool returns all records with no date or
+        status filtering.
+
+        For ANY filtered query — absent today, late this week, present in a
+        date range, by department, by name — use sql_query instead, which
+        supports precise WHERE conditions.
 
         Args:
-            all_employees: Pass 'true' to get all employees' records (admin only),
-                           or 'false' (default) for the current user's records only.
+            all_employees: 'true' for all employees (admin only); 'false' for own records.
         """
         want_all = _to_bool(all_employees)
         if not user:
-            return json.dumps({"success": False, "message": "Login required to view attendance."})
+            return json.dumps({"success": False, "message": "Login required."})
         if want_all and user.get("role") != "admin":
-            return json.dumps({"success": False, "message": "Admin access required to view all attendance."})
+            return json.dumps({"success": False, "message": "Admin access required."})
         records = db_get_attendance(employee_id=None if want_all else user["employee_id"])
         return json.dumps({"success": True, "records": records})
 
-    # ── generate_chart — custom schema so both arrays and JSON strings are accepted ──
+    # ── generate_chart ─────────────────────────────────────────────────────────
 
     class _ChartInput(BaseModel):
         chart_type:    str
         title:         str
-        labels:        str   # LLM sends JSON array string; validator also accepts native list
+        labels:        str
         dataset_label: str
-        data:          str   # LLM sends JSON array string; validator also accepts native list
+        data:          str
 
         @field_validator("labels", "data", mode="before")
         @classmethod
         def _coerce_to_json_str(cls, v):
-            """Accept native list OR JSON string — normalise to JSON string."""
             if isinstance(v, (list, tuple)):
                 return json.dumps(v)
             return v
 
-    def _generate_chart(
-        chart_type: str,
-        title: str,
-        labels: str,
-        dataset_label: str,
-        data: str,
-    ) -> str:
+    def _generate_chart(chart_type, title, labels, dataset_label, data) -> str:
         try:
             label_list = _parse_list(labels, str)
             data_list  = _parse_list(data, float)
         except (ValueError, TypeError) as exc:
             return f"Error parsing chart data: {exc}"
-
         return json.dumps({
-            "type": "chart",
-            "chart_type": chart_type,
-            "title": title,
-            "labels": label_list,
+            "type":          "chart",
+            "chart_type":    chart_type,
+            "title":         title,
+            "labels":        label_list,
             "dataset_label": dataset_label,
-            "data": data_list,
+            "data":          data_list,
         })
 
     generate_chart = StructuredTool.from_function(
@@ -291,14 +360,10 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
         args_schema=_ChartInput,
         description=(
             "Render a visual chart from query results. "
-            "Call this AFTER sql_query when the user asks for a chart, graph, or visualization.\n\n"
-            "chart_type choices:\n"
-            "  'bar'      — compare values across categories (products, roles, departments)\n"
-            "  'line'     — trends over time (monthly sales, daily counts)\n"
-            "  'pie'      — proportions of a whole (category revenue share)\n"
-            "  'doughnut' — same as pie, visually lighter\n\n"
-            "labels: JSON array of category/time label strings, e.g. '[\"Jan\",\"Feb\",\"Mar\"]'\n"
-            "data:   JSON array of matching numeric values,    e.g. '[1200.5, 980.0, 1450.0]'"
+            "Call AFTER sql_query when the user asks for a chart/graph/visualization.\n\n"
+            "chart_type: 'bar' | 'line' | 'pie' | 'doughnut'\n"
+            "labels: JSON array of category/time strings, e.g. '[\"Jan\",\"Feb\"]'\n"
+            "data:   JSON array of matching numbers,       e.g. '[1200.5, 980.0]'"
         ),
     )
 
@@ -306,17 +371,17 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
             get_attendance_report, generate_chart]
 
 
-# ── Streaming entry point (SSE) ────────────────────────────────────────────────
+# ── Streaming entry point ──────────────────────────────────────────────────────
 
 def stream_message(message: str, user: dict | None = None):
     """
-    Generator yielding newline-delimited JSON events for SSE.
+    Generator yielding newline-delimited JSON events.
 
     Event shapes:
-        {"status": "..."}              — typing indicator while tools run
-        {"token": "..."}               — text token streamed to live bubble
-        {"done": true}                 — text streaming complete (no structured data)
-        {"done": true, "data": {...}}  — structured response (table / attendance / error)
+        {"status": "..."}                        — tool-running indicator
+        {"token": "..."}                         — streaming text token
+        {"done": true, "confidence": N}          — text complete
+        {"done": true, "data": {...}, "confidence": N} — structured response
     """
     user_ctx = (
         f"Current user: {user['name']} | role: {user['role']} | "
@@ -324,26 +389,25 @@ def stream_message(message: str, user: dict | None = None):
         if user else "User is not authenticated."
     )
 
+    tracker = _ConfidenceTracker()
+
     try:
-        db = _get_db()
+        db    = _get_db()
         tools = _make_tools(user, db)
         agent = create_react_agent(get_llm(), tools)
 
         tool_status_shown: set[str] = set()
         attendance_action: dict | None = None
-        attendance_table: list | None = None
-        chart_data: dict | None = None
+        attendance_table:  list | None = None
+        chart_data:        dict | None = None
 
-        # Per-step token buffer — Llama 3 leaks tool-call syntax as text content
-        # BEFORE setting tool_call_chunks. Buffer each agent step; only flush the
-        # buffer when the step completes with no tool calls (i.e. it's a real reply).
-        token_buffer: list[str] = []
-        current_step: int = -1
+        token_buffer:      list[str] = []
+        current_step:      int  = -1
         step_is_tool_call: bool = False
 
         for chunk, metadata in agent.stream(
             {"messages": [
-                SystemMessage(content=f"{_SYSTEM}\n\n{user_ctx}"),
+                SystemMessage(content=_build_system(user_ctx)),
                 HumanMessage(content=message),
             ]},
             stream_mode="messages",
@@ -352,14 +416,13 @@ def stream_message(message: str, user: dict | None = None):
             step = metadata.get("langgraph_step", 0)
 
             if node == "agent" and isinstance(chunk, AIMessageChunk):
-                # New agent round detected — evaluate the previous round
                 if step != current_step:
                     if current_step >= 0 and not step_is_tool_call:
                         for tok in token_buffer:
                             yield json.dumps({"token": tok}) + "\n"
-                    token_buffer = []
+                    token_buffer      = []
                     step_is_tool_call = False
-                    current_step = step
+                    current_step      = step
 
                 if chunk.tool_call_chunks:
                     step_is_tool_call = True
@@ -375,65 +438,80 @@ def stream_message(message: str, user: dict | None = None):
                         token_buffer.append(text)
 
             elif node == "tools" and isinstance(chunk, ToolMessage):
-                if chunk.name == "mark_attendance":
+                # ── confidence tracking ────────────────────────────────────
+                if chunk.name == "sql_query":
+                    tracker.record_sql(chunk.content)
+
+                elif chunk.name == "search_pdf_library":
+                    tracker.record_pdf(chunk.content)
+
+                elif chunk.name == "mark_attendance":
                     try:
                         attendance_action = json.loads(chunk.content)
+                        tracker.record_tool_success(attendance_action.get("success", False))
                     except Exception:
                         pass
+
                 elif chunk.name == "get_attendance_report":
                     try:
                         res = json.loads(chunk.content)
+                        tracker.record_tool_success(res.get("success", False))
                         if res.get("success"):
                             attendance_table = res["records"]
                     except Exception:
                         pass
+
                 elif chunk.name == "generate_chart":
                     try:
                         chart_data = json.loads(chunk.content)
                     except Exception:
                         pass
 
-        # Flush the last agent step's buffer if it was a plain text response
+        # Flush last agent step if it was a plain text reply
         if not step_is_tool_call and token_buffer:
             for tok in token_buffer:
                 yield json.dumps({"token": tok}) + "\n"
 
-        # Emit final structured response (priority: chart > attendance > text)
+        confidence = tracker.get()
+        logger.info("Response confidence: %d%%", confidence)
+
+        # Emit final structured payload (priority: chart > attendance > text)
         if chart_data:
-            yield json.dumps({"done": True, "data": chart_data}) + "\n"
+            yield json.dumps({"done": True, "data": chart_data, "confidence": confidence}) + "\n"
         elif attendance_action:
             yield json.dumps({
                 "done": True,
                 "data": {
-                    "type": "attendance",
-                    "status": "success" if attendance_action.get("success") else "error",
+                    "type":    "attendance",
+                    "status":  "success" if attendance_action.get("success") else "error",
                     "message": attendance_action.get("message", ""),
                 },
+                "confidence": confidence,
             }) + "\n"
         elif attendance_table is not None:
             yield json.dumps({
                 "done": True,
                 "data": {"type": "attendance_table", "data": attendance_table},
+                "confidence": confidence,
             }) + "\n"
         else:
-            yield json.dumps({"done": True}) + "\n"
+            yield json.dumps({"done": True, "confidence": confidence}) + "\n"
 
     except Exception as exc:
         import traceback
         traceback.print_exc()
         msg = _friendly_error(exc)
-        s = str(exc)
+        s   = str(exc)
         is_failed = "failed_generation" in s or "Failed to call a function" in s
         payload: dict = {"type": "error", "message": msg}
         if is_failed:
             payload["suggestions"] = _SUGGESTIONS
-        yield json.dumps({"done": True, "data": payload}) + "\n"
+        yield json.dumps({"done": True, "data": payload, "confidence": 0}) + "\n"
 
 
-# ── Synchronous entry point (kept for compatibility) ───────────────────────────
+# ── Synchronous wrapper (kept for compatibility) ───────────────────────────────
 
 def process_message(message: str, user: dict | None = None) -> dict:
-    """Synchronous wrapper — collects stream_message() into a single dict."""
     last: dict = {"type": "error", "message": "No response."}
     for line in stream_message(message, user):
         line = line.strip()
