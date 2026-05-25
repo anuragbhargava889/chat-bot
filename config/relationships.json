@@ -1,20 +1,6 @@
 {
   "relationships": [
     {
-      "left_table": "attendance",
-      "right_table": "employees",
-      "left_key": "employee_id",
-      "right_key": "employee_id",
-      "join_type": "INNER"
-    },
-    {
-      "left_table": "sales",
-      "right_table": "products",
-      "left_key": "product_id",
-      "right_key": "product_id",
-      "join_type": "INNER"
-    },
-    {
       "left_table": "tstock_movement",
       "right_table": "tuser_stock",
       "left_key": "imei",

@@ -6,12 +6,13 @@ Write operations (INSERT/UPDATE) use adapter.execute_write() with raw SQL and
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import date, datetime
 
 from db.factory import get_adapter
 from db.query_builder import QueryBuilder
-from config import get_table_config
+from config import get_table_config, get_local_users
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,21 @@ def _t() -> dict:
 
 def get_employee_by_username(username: str) -> dict | None:
     t = _t()
+    employees_table = t.get("employees")
+
+    if not employees_table:
+        # No DB employees table — check config/users.json
+        for u in get_local_users():
+            if u.get("username") == username:
+                user = dict(u)
+                plain = user.pop("password", "")
+                user["password"] = hashlib.sha256(plain.encode()).hexdigest()
+                user.setdefault("employee_id", 0)
+                return user
+        return None
+
     rows = (
-        QueryBuilder(t["employees"])
+        QueryBuilder(employees_table)
         .select("*")
         .where("username = :username", username=username)
         .limit(1)
@@ -39,7 +53,9 @@ def get_employee_by_username(username: str) -> dict | None:
 def mark_attendance(employee_id: int, action: str) -> dict:
     adapter = get_adapter()
     t   = _t()
-    tbl = t["attendance"]
+    tbl = t.get("attendance")
+    if not tbl:
+        return {"status": "error", "message": "'attendance' table not configured in tables.json."}
     today = date.today()
 
     try:
@@ -95,8 +111,11 @@ def mark_attendance(employee_id: int, action: str) -> dict:
 
 def get_attendance_report(employee_id: int | None = None) -> list[dict]:
     t    = _t()
-    atbl = t["attendance"]
-    etbl = t["employees"]
+    atbl = t.get("attendance")
+    etbl = t.get("employees")
+    if not atbl or not etbl:
+        logger.warning("'attendance' or 'employees' key missing from tables.json — report empty")
+        return []
 
     qb = (
         QueryBuilder(f"{atbl} a")

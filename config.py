@@ -33,15 +33,33 @@ def get_table_config() -> dict:
     try:
         return _load_json("tables.json")
     except FileNotFoundError:
-        # Backward-compatible defaults if the file is missing
-        return {
-            "employees":      "employees",
-            "products":       "products",
-            "sales":          "sales",
-            "attendance":     "attendance",
-            "stock_movement": "tstock_movement",
-            "user_stock":     "tuser_stock",
-        }
+        raise FileNotFoundError(
+            "config/tables.json not found. "
+            "Create it with your actual table name mappings (see .env.example)."
+        )
+
+
+def get_local_users() -> list[dict]:
+    """Return users from config/users.json.
+
+    Used when no 'employees' table is configured in tables.json.
+    Passwords are stored in plain text here and hashed at comparison time.
+    """
+    try:
+        return _load_json("users.json")
+    except FileNotFoundError:
+        return []
+
+
+def get_column_hints() -> dict:
+    """Return logical-name → column-list string from table_columns.json.
+
+    This is optional — tables without an entry are listed by name only.
+    """
+    try:
+        return _load_json("table_columns.json")
+    except FileNotFoundError:
+        return {}
 
 
 def get_relationship_config() -> dict:

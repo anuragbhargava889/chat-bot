@@ -25,21 +25,16 @@
 
     <nav class="sidebar-nav">
       <p class="nav-label">Quick commands</p>
-      <button class="quick-btn" data-msg="Show sales for Laptop Pro">Laptop sales</button>
-      <button class="quick-btn" data-msg="Show sales for Monitor 4K">Monitor sales</button>
-      <button class="quick-btn" data-msg="Check in">Check in</button>
-      <button class="quick-btn" data-msg="Check out">Check out</button>
+      <button class="quick-btn" data-msg="Show available tables and describe their structure">Explore tables</button>
+      <button class="quick-btn" data-msg="Show total stock summary">Stock summary</button>
+      <button class="quick-btn" data-msg="Show top 10 records by item price">Top by price</button>
       {% if user.role == 'admin' %}
-      <button class="quick-btn" data-msg="Show all attendance">All attendance</button>
       <button class="quick-btn admin-btn" id="reload-pdfs-btn">Reload PDFs</button>
-      {% else %}
-      <button class="quick-btn" data-msg="Show attendance">My attendance</button>
       {% endif %}
       <p class="nav-label" style="margin-top:.75rem">Charts</p>
-      <button class="quick-btn" data-msg="Show top 5 products by revenue as a bar chart">Top 5 bar chart</button>
-      <button class="quick-btn" data-msg="Show bottom 5 products by revenue as a bar chart">Bottom 5 bar chart</button>
-      <button class="quick-btn" data-msg="Show revenue share by product category as a pie chart">Category pie chart</button>
-      <button class="quick-btn" data-msg="Show monthly sales trend as a line chart">Monthly trend</button>
+      <button class="quick-btn" data-msg="Show top 10 items by price as a bar chart">Top 10 bar chart</button>
+      <button class="quick-btn" data-msg="Show stock distribution by category as a pie chart">Category pie chart</button>
+      <button class="quick-btn" data-msg="Show stock movement trend as a line chart">Movement trend</button>
     </nav>
 
     <div class="sidebar-pdfs">

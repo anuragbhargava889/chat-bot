@@ -25,7 +25,7 @@ from langchain_core.tools import StructuredTool, tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, field_validator
 
-from config import get_db_uri, get_llm, get_table_config, get_relationship_config, get_dialect_hints, DB_TYPE, CURRENCY_SYMBOL
+from config import get_db_uri, get_llm, get_table_config, get_column_hints, get_relationship_config, get_dialect_hints, DB_TYPE, CURRENCY_SYMBOL
 from database import (
     get_attendance_report as db_get_attendance,
     mark_attendance as db_mark_attendance,
@@ -82,19 +82,16 @@ class _ConfidenceTracker:
 # ── System prompt (built dynamically from config) ──────────────────────────────
 
 def _build_system(user_ctx: str) -> str:
-    tables = get_table_config()
-    rels   = get_relationship_config().get("relationships", [])
+    tables   = get_table_config()     # {logical_key: actual_table_name}
+    col_hints = get_column_hints()    # {logical_key: "col1, col2, ..."}  (optional)
+    rels     = get_relationship_config().get("relationships", [])
 
-    # Table descriptions (logical name → actual columns kept fixed; table names from config)
-    tbl_cols = {
-        tables["employees"]:      "username, name, email, department, role",
-        tables["products"]:       "name, category, price",
-        tables["sales"]:          "product_id, quantity, amount, sale_date",
-        tables["attendance"]:     "employee_id, date, check_in, check_out, status",
-        tables["stock_movement"]: "from_role, to_role, status, movement_type, item_price, sales_price, imei, material_code, dbr_code, moved_date",
-        tables["user_stock"]:     "model_no, model_name, item_main_category, series, imei1, imei2, each_line_item_price, invoice_no, dbr_name, status, quantity, stock_date",
-    }
-    tables_str = ", ".join(f"{tbl}({cols})" for tbl, cols in tbl_cols.items())
+    # Build table descriptions purely from config — no hardcoded names or columns
+    tbl_parts = []
+    for logical_key, actual_table in tables.items():
+        cols = col_hints.get(logical_key)
+        tbl_parts.append(f"{actual_table}({cols})" if cols else actual_table)
+    tables_str = ", ".join(tbl_parts)
 
     # Relationship hints for JOIN queries
     rel_lines = [
@@ -105,6 +102,13 @@ def _build_system(user_ctx: str) -> str:
     rel_str = "\n".join(rel_lines) if rel_lines else "  (use sql_schema to discover FK columns)"
 
     date_hint = get_dialect_hints()
+
+    attendance_rule = (
+        "\n5b. For check-in/out use mark_attendance. "
+        "Use get_attendance_report only for unfiltered history. "
+        "For filtered attendance queries use sql_query."
+        if ("attendance" in tables and "employees" in tables) else ""
+    )
 
     return f"""You are a company assistant with access to a {DB_TYPE.upper()} database and PDF library.
 
@@ -118,13 +122,10 @@ Rules:
 2. {date_hint}
 3. Rankings: ORDER BY … LIMIT N. Summaries: GROUP BY + aggregate functions.
 4. Multi-table data: write explicit JOIN queries using the relationships above.
-5. For PDF questions use search_pdf_library and cite the source.
-6. For check-in/out use mark_attendance.
-   Use get_attendance_report ONLY for plain "show my attendance" or "show all attendance" with no filters.
-   For ANY filtered attendance query (by date, status, department, name, today, this week, absent, late, etc.)
-   use sql_query — never get_attendance_report.
-7. For charts: call sql_query first, then generate_chart with the results.
-8. Always use {CURRENCY_SYMBOL} as the currency symbol for all monetary values. Never use $.
+5. For PDF questions use search_pdf_library and cite the source.{attendance_rule}
+6. For charts: call sql_query first, then generate_chart with the results.
+7. Always use {CURRENCY_SYMBOL} as the currency symbol for all monetary values. Never use $.
+8. Use sql_schema to inspect column definitions when unsure about column names.
 9. Be concise.
 
 {user_ctx}"""
@@ -133,12 +134,12 @@ Rules:
 # ── Fallback suggestions ───────────────────────────────────────────────────────
 
 _SUGGESTIONS = [
-    "Show top 5 selling products",
-    "What is the average monthly sales?",
-    "Show a bar chart of sales by category",
-    "Show my attendance history",
+    "Show available tables and their structure",
+    "Show total stock summary",
+    "Show top 10 items by price as a bar chart",
+    "Show stock movement trend as a line chart",
     "What stock items are available?",
-    "Show monthly sales trend as a line chart",
+    "Show stock distribution by category as a pie chart",
 ]
 
 
@@ -367,8 +368,11 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
         ),
     )
 
-    return [sql_query, sql_schema, search_pdf_library, mark_attendance,
-            get_attendance_report, generate_chart]
+    configured = get_table_config()
+    tool_list  = [sql_query, sql_schema, search_pdf_library, generate_chart]
+    if "attendance" in configured and "employees" in configured:
+        tool_list += [mark_attendance, get_attendance_report]
+    return tool_list
 
 
 # ── Streaming entry point ──────────────────────────────────────────────────────
