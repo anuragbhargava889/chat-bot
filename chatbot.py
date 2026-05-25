@@ -125,8 +125,14 @@ Rules:
 5. For PDF questions use search_pdf_library and cite the source.{attendance_rule}
 6. For charts: call sql_query first, then generate_chart with the results.
 7. Always use {CURRENCY_SYMBOL} as the currency symbol for all monetary values. Never use $.
-8. Use sql_schema to inspect column definitions when unsure about column names.
-9. Be concise.
+8. Column value discovery: when a query uses a WHERE filter on a text column whose values you
+   don't know, FIRST run one discovery query:
+     SELECT DISTINCT <column> FROM <table> LIMIT 30
+   Use the returned values to build the real query. Do this at most ONCE per column.
+9. Empty results: if a query returns no rows, respond immediately with a clear
+   "No data found for [topic]" message. Do NOT retry with alternative column names,
+   alternative spellings, or reformulated queries.
+10. Be concise.
 
 {user_ctx}"""
 
@@ -181,6 +187,13 @@ def _clean(text: str) -> str:
 
 def _friendly_error(exc: Exception) -> str:
     s = str(exc)
+    if "GraphRecursionError" in type(exc).__name__ or "Recursion limit" in s:
+        return (
+            "No data found. The query could not be completed — "
+            "the requested information may not exist in the database, "
+            "or the column values did not match. "
+            "Try a more specific question or check the table schema."
+        )
     if "rate_limit_exceeded" in s or "429" in s:
         wait = re.search(r"try again in ([\w.]+)", s)
         wait_msg = f" Please try again in {wait.group(1)}." if wait else " Please try again shortly."
@@ -232,6 +245,9 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
         Call sql_schema first when unsure about column names.
         Use ORDER BY … LIMIT for top-N queries; GROUP BY + aggregates for summaries.
         Write explicit JOIN queries using the relationships listed in the system prompt.
+
+        IMPORTANT: if the result is empty, do NOT call this tool again with a different
+        query — report "No data found" to the user immediately.
 
         Args:
             query: A valid SQL SELECT or WITH statement.
@@ -414,6 +430,7 @@ def stream_message(message: str, user: dict | None = None):
                 SystemMessage(content=_build_system(user_ctx)),
                 HumanMessage(content=message),
             ]},
+            {"recursion_limit": 10},
             stream_mode="messages",
         ):
             node = metadata.get("langgraph_node", "")
