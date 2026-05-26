@@ -119,6 +119,7 @@ Pre-configured JOIN relationships (use these as a guide — add others as needed
 
 Rules:
 1. Use sql_query for all data questions. SELECT / WITH only — never INSERT/UPDATE/DELETE/DROP.
+   Always include a LIMIT clause in every SELECT query (e.g. LIMIT 50 for lists, LIMIT 200 for reports).
 2. {date_hint}
 3. Rankings: ORDER BY … LIMIT N. Summaries: GROUP BY + aggregate functions.
 4. Multi-table data: write explicit JOIN queries using the relationships above.
@@ -181,6 +182,16 @@ def _extract_text(content) -> str:
 
 _SPECIAL_TOKENS = re.compile(r"<\|[a-zA-Z0-9_]+\|>")
 
+# Hard-cap on sql_query result size — backstop after LIMIT is already enforced.
+_SQL_MAX_CHARS = 20_000
+
+
+def _enforce_limit(query: str, default: int = 200) -> str:
+    """Append a default LIMIT if the query has none, preventing unbounded fetches."""
+    if "LIMIT" not in query.upper():
+        return query.rstrip("; \n") + f" LIMIT {default}"
+    return query
+
 def _clean(text: str) -> str:
     return _SPECIAL_TOKENS.sub("", text)
 
@@ -193,6 +204,11 @@ def _friendly_error(exc: Exception) -> str:
             "the requested information may not exist in the database, "
             "or the column values did not match. "
             "Try a more specific question or check the table schema."
+        )
+    if "AnthropicContextOverflowError" in type(exc).__name__ or "prompt is too long" in s:
+        return (
+            "The query returned too much data for the AI to process. "
+            "Try a more specific query — for example, add a date range filter or reduce the columns selected."
         )
     if "rate_limit_exceeded" in s or "429" in s:
         wait = re.search(r"try again in ([\w.]+)", s)
@@ -256,9 +272,20 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
         upper = stripped.upper()
         if not (upper.startswith("SELECT") or upper.startswith("WITH")):
             return "Error: Only SELECT and WITH queries are permitted."
-        logger.info("sql_query: %s", stripped[:200])
+        bounded = _enforce_limit(stripped)
+        if bounded != stripped:
+            logger.info("sql_query: no LIMIT found — appended LIMIT 200")
+        logger.info("sql_query: %s", bounded[:200])
         try:
-            return db.run(stripped)
+            result = db.run(bounded)
+            if len(result) > _SQL_MAX_CHARS:
+                logger.warning("sql_query result still large (%d chars) — truncating", len(result))
+                result = (
+                    result[:_SQL_MAX_CHARS]
+                    + f"\n\n[Result truncated at {_SQL_MAX_CHARS} chars. "
+                    "Narrow the query (fewer columns, tighter date range) to see complete results.]"
+                )
+            return result
         except Exception as exc:
             logger.warning("sql_query failed: %s", exc)
             return f"Query error: {exc}"
