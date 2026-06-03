@@ -356,6 +356,26 @@
     });
   }
 
+  // ── sync schema (admin) ───────────────────────────────────────────────────
+
+  const syncSchemaBtn = document.getElementById('sync-schema-btn');
+  if (syncSchemaBtn) {
+    syncSchemaBtn.addEventListener('click', async () => {
+      syncSchemaBtn.disabled = true;
+      syncSchemaBtn.textContent = 'Syncing…';
+      try {
+        const res  = await fetch('/api/sync-schema', { method: 'POST' });
+        const data = await res.json();
+        appendMessage('bot', renderMarkdown(escHtml(data.message || data.error)));
+      } catch {
+        appendMessage('bot', '<span class="status-error">Schema sync failed.</span>');
+      } finally {
+        syncSchemaBtn.disabled = false;
+        syncSchemaBtn.textContent = 'Sync Schema';
+      }
+    });
+  }
+
   // ── PDF list sidebar ──────────────────────────────────────────────────────
 
   async function loadPdfList() {

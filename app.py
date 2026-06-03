@@ -3,7 +3,7 @@ import logging
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 
-from chatbot import stream_message
+from chatbot import invalidate_sql_db_cache, stream_message
 from config import SECRET_KEY, CURRENCY_SYMBOL
 from database import get_employee_by_username
 from pdf_handler import get_pdf_list, load_pdfs
@@ -16,13 +16,14 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Auto-sync FK relationships from the live DB schema at startup.
-# Falls back silently to the existing relationships.json if the DB is not yet reachable.
+# Auto-sync all DB schemas (columns + FK relationships) at startup.
+# Falls back silently if any DB is not yet reachable.
 try:
-    from config import sync_relationships
-    sync_relationships()
+    from config import sync_all_db_schemas
+    sync_all_db_schemas()
 except Exception as _sync_exc:
-    logger.warning("Relationship auto-sync skipped: %s", _sync_exc)
+    logger.warning("Schema auto-sync skipped: %s", _sync_exc)
+
 app.secret_key = SECRET_KEY
 
 
@@ -30,7 +31,7 @@ def _hash(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-# ── auth helpers ─────────────────────────────────────────────────────────────
+# ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def _current_user() -> dict | None:
     return session.get("user")
@@ -49,7 +50,7 @@ def _require_admin():
     return None
 
 
-# ── pages ─────────────────────────────────────────────────────────────────────
+# ── Pages ─────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -72,10 +73,10 @@ def login():
         if employee and employee["password"] == _hash(password):
             session["user"] = {
                 "employee_id": employee["employee_id"],
-                "name": employee["name"],
-                "role": employee["role"],
-                "username": employee["username"],
-                "department": employee.get("department", ""),
+                "name":        employee["name"],
+                "role":        employee["role"],
+                "username":    employee["username"],
+                "department":  employee.get("department", ""),
             }
             return redirect(url_for("index"))
         error = "Invalid username or password."
@@ -97,7 +98,7 @@ def chat():
     if redir:
         return jsonify({"error": "Not authenticated."}), 401
 
-    data = request.get_json(silent=True) or {}
+    data    = request.get_json(silent=True) or {}
     message = data.get("message", "").strip()
     if not message:
         return jsonify({"error": "Empty message."}), 400
@@ -131,7 +132,33 @@ def reload_pdfs():
     return jsonify({"message": "PDF library reloaded successfully."})
 
 
-# ── run ───────────────────────────────────────────────────────────────────────
+@app.route("/api/sync-schema", methods=["POST"])
+def sync_schema():
+    """Re-discover columns and FK relationships for all configured databases.
+
+    Also invalidates the SQLDatabase cache so the agent picks up any new tables
+    added to tables.json since the last sync.
+    Admin only.
+    """
+    err = _require_admin()
+    if err:
+        return err
+
+    from config import get_databases_config, sync_all_db_schemas
+
+    try:
+        sync_all_db_schemas()
+        invalidate_sql_db_cache()
+        db_names = [c["name"] for c in get_databases_config()]
+        return jsonify({
+            "message": f"Schema synced for: {', '.join(db_names)}.",
+        })
+    except Exception as exc:
+        logger.error("Schema sync failed: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+# ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)

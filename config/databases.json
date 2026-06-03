@@ -1,0 +1,10 @@
+{
+    "databases": [
+      {
+        "name": "main_db",
+        "type": "mongodb",
+        "env_prefix": "MONGO",
+        "description": "Main stock database — stock movement and user stock"
+      }
+    ]
+}

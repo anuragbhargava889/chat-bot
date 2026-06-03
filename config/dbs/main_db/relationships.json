@@ -1,0 +1,11 @@
+{
+  "relationships": [
+    {
+      "left_table": "tstock_movement",
+      "right_table": "tuser_stock",
+      "left_key": "imei",
+      "right_key": "imei1",
+      "join_type": "LEFT"
+    }
+  ]
+}
