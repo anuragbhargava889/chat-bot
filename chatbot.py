@@ -1,16 +1,15 @@
-"""Chatbot core — LangGraph ReAct agent + LangChain SQLDatabase.
+"""Chatbot core — LangGraph ReAct agent with multi-database support.
 
 Entry points:
   stream_message()  → NDJSON events (SSE endpoint)
   process_message() → dict (synchronous, kept for compatibility)
 
-Tools:
-  sql_query             — Dynamic SELECT on all configured tables
-  sql_schema            — Table schema / column introspection
-  search_pdf_library    — ChromaDB semantic search over PDFs
-  mark_attendance       — Controlled attendance write
-  get_attendance_report — Structured attendance read
-  generate_chart        — Chart.js chart payload generator
+Tool naming convention (auto-generated per databases.json):
+  query_<db_name>   — SELECT queries on a SQL database
+  schema_<db_name>  — Column info for a SQL database
+  query_<db_name>   — Aggregation pipeline queries on MongoDB
+  search_pdf_library
+  generate_chart
 """
 from __future__ import annotations
 
@@ -25,10 +24,13 @@ from langchain_core.tools import StructuredTool, tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, field_validator
 
-from config import get_db_uri, get_llm, get_table_config, get_column_hints, get_relationship_config, get_dialect_hints, DB_TYPE, CURRENCY_SYMBOL
-from database import (
-    get_attendance_report as db_get_attendance,
-    mark_attendance as db_mark_attendance,
+from config import (
+    get_databases_config,
+    get_db_columns,
+    get_db_relationships,
+    get_db_tables,
+    get_llm,
+    CURRENCY_SYMBOL,
 )
 from pdf_handler import query_pdfs
 
@@ -38,8 +40,6 @@ logger = logging.getLogger(__name__)
 # ── Confidence tracker ─────────────────────────────────────────────────────────
 
 class _ConfidenceTracker:
-    """Accumulates evidence during a single agent turn to produce a confidence %."""
-
     def __init__(self):
         self._score: float = 85.0
 
@@ -47,92 +47,122 @@ class _ConfidenceTracker:
         r = result.strip()
         if r.startswith("Query error:") or r.startswith("Error:"):
             self._score -= 35
-            logger.debug("Confidence: SQL error → %.0f", self._score)
         elif not r or r in ("[]", "None", ""):
             self._score -= 20
-            logger.debug("Confidence: SQL empty → %.0f", self._score)
         else:
             self._score = min(98, self._score + 5)
-            logger.debug("Confidence: SQL data → %.0f", self._score)
 
     def record_pdf(self, result_json: str) -> None:
         try:
             res = json.loads(result_json)
             if res.get("found") and res.get("chunks"):
-                chunks = res["chunks"]
-                avg_rel = sum(c.get("relevance", 0.5) for c in chunks) / len(chunks)
-                bonus = (avg_rel - 0.5) * 12
-                self._score = min(98, self._score + bonus)
-                logger.debug("Confidence: PDF found (rel=%.2f) → %.0f", avg_rel, self._score)
+                avg_rel = sum(c.get("relevance", 0.5) for c in res["chunks"]) / len(res["chunks"])
+                self._score = min(98, self._score + (avg_rel - 0.5) * 12)
             else:
                 self._score -= 15
-                logger.debug("Confidence: PDF not found → %.0f", self._score)
         except Exception:
             pass
 
     def record_tool_success(self, success: bool) -> None:
         if not success:
             self._score -= 10
-            logger.debug("Confidence: tool fail → %.0f", self._score)
 
     def get(self) -> int:
         return round(max(10, min(98, self._score)))
 
 
-# ── System prompt (built dynamically from config) ──────────────────────────────
+# ── System prompt ──────────────────────────────────────────────────────────────
 
 def _build_system(user_ctx: str) -> str:
-    tables   = get_table_config()     # {logical_key: actual_table_name}
-    col_hints = get_column_hints()    # {logical_key: "col1, col2, ..."}  (optional)
-    rels     = get_relationship_config().get("relationships", [])
+    dbs = get_databases_config()
 
-    # Build table descriptions purely from config — no hardcoded names or columns
-    tbl_parts = []
-    for logical_key, actual_table in tables.items():
-        cols = col_hints.get(logical_key)
-        tbl_parts.append(f"{actual_table}({cols})" if cols else actual_table)
-    tables_str = ", ".join(tbl_parts)
+    db_sections: list[str] = []
+    sql_types: set[str] = set()
 
-    # Relationship hints for JOIN queries
-    rel_lines = [
-        f"  - {r['left_table']} {r['join_type']} JOIN {r['right_table']}"
-        f" ON {r['left_table']}.{r['left_key']} = {r['right_table']}.{r['right_key']}"
-        for r in rels
-    ]
-    rel_str = "\n".join(rel_lines) if rel_lines else "  (use sql_schema to discover FK columns)"
+    for cfg in dbs:
+        db_name = cfg["name"]
+        db_type = cfg["type"].lower()
+        tables  = get_db_tables(db_name)
+        cols    = get_db_columns(db_name)
+        rels    = get_db_relationships(db_name)
 
-    date_hint = get_dialect_hints()
+        tbl_parts = [
+            f"{actual}({cols[logical]})" if logical in cols else actual
+            for logical, actual in tables.items()
+        ]
 
-    attendance_rule = (
-        "\n5b. For check-in/out use mark_attendance. "
-        "Use get_attendance_report only for unfiltered history. "
-        "For filtered attendance queries use sql_query."
-        if ("attendance" in tables and "employees" in tables) else ""
-    )
+        if db_type == "mongodb":
+            lines = [
+                f"  [{db_name}] MongoDB — {cfg['description']}",
+                f"    Collections : {', '.join(tbl_parts) or '(none configured)'}",
+                f"    Tool        : query_{db_name}  (aggregation pipeline JSON)",
+            ]
+        else:
+            sql_types.add(db_type)
+            dialect = "MySQL" if db_type == "mysql" else "PostgreSQL"
+            rel_lines = [
+                f"      {r['left_table']} {r['join_type']} JOIN {r['right_table']}"
+                f" ON {r['left_table']}.{r['left_key']} = {r['right_table']}.{r['right_key']}"
+                for r in rels
+            ]
+            lines = [
+                f"  [{db_name}] {dialect} — {cfg['description']}",
+                f"    Tables : {', '.join(tbl_parts) or '(none configured)'}",
+            ]
+            if rel_lines:
+                lines.append("    JOINs  :\n" + "\n".join(rel_lines))
+            lines.append(f"    Tools  : query_{db_name}, schema_{db_name}")
 
-    return f"""You are a company assistant with access to a {DB_TYPE.upper()} database and PDF library.
+        db_sections.append("\n".join(lines))
 
-Tables: {tables_str}
+    databases_str = "\n\n".join(db_sections) if db_sections else "  (no databases configured)"
 
-Pre-configured JOIN relationships (use these as a guide — add others as needed):
-{rel_str}
+    # Build date-function hint from actual DB types in databases.json, not from DB_TYPE env var.
+    pg  = sql_types & {"postgresql", "postgres", "pg"}
+    my  = sql_types & {"mysql"}
+    if pg and my:
+        date_hint = (
+            "MySQL date functions: MONTH(col), YEAR(col), CURDATE(), NOW(), DATE_SUB(CURDATE(), INTERVAL N DAY). "
+            "PostgreSQL date functions: EXTRACT(MONTH FROM col), EXTRACT(YEAR FROM col), CURRENT_DATE, NOW(), "
+            "DATE_TRUNC('month', col), (CURRENT_DATE - INTERVAL '7 days'). "
+            "Use the correct syntax for each database's query tool."
+        )
+    elif pg:
+        date_hint = (
+            "Date functions (PostgreSQL): EXTRACT(MONTH FROM col), EXTRACT(YEAR FROM col), "
+            "CURRENT_DATE, NOW(), DATE_TRUNC('month', col), (CURRENT_DATE - INTERVAL '7 days')."
+        )
+    elif my:
+        date_hint = (
+            "Date functions (MySQL): MONTH(col), YEAR(col), CURDATE(), NOW(), "
+            "DATE_SUB(CURDATE(), INTERVAL N DAY), DATE_FORMAT(col, '%Y-%m')."
+        )
+    else:
+        date_hint = ""
+
+    return f"""You are a company assistant with access to one or more databases and a PDF library.
+
+Databases:
+{databases_str}
 
 Rules:
-1. Use sql_query for all data questions. SELECT / WITH only — never INSERT/UPDATE/DELETE/DROP.
-   Always include a LIMIT clause in every SELECT query (e.g. LIMIT 50 for lists, LIMIT 200 for reports).
+1. Choose the query tool that matches the database description and the question.
+   SQL  : Always include a LIMIT clause. SELECT/WITH only — never INSERT/UPDATE/DELETE/DROP.
+   Mongo: Write an aggregation pipeline JSON array. Always include a $limit stage.
+          Never use $out or $merge.
 2. {date_hint}
-3. Rankings: ORDER BY … LIMIT N. Summaries: GROUP BY + aggregate functions.
-4. Multi-table data: write explicit JOIN queries using the relationships above.
-5. For PDF questions use search_pdf_library and cite the source.{attendance_rule}
-6. For charts: call sql_query first, then generate_chart with the results.
-7. Always use {CURRENCY_SYMBOL} as the currency symbol for all monetary values. Never use $.
-8. Column value discovery: when a query uses a WHERE filter on a text column whose values you
-   don't know, FIRST run one discovery query:
-     SELECT DISTINCT <column> FROM <table> LIMIT 30
-   Use the returned values to build the real query. Do this at most ONCE per column.
-9. Empty results: if a query returns no rows, respond immediately with a clear
-   "No data found for [topic]" message. Do NOT retry with alternative column names,
-   alternative spellings, or reformulated queries.
+3. Rankings : ORDER BY … LIMIT N (SQL) | $sort + $limit (Mongo).
+   Summaries: GROUP BY + aggregates (SQL) | $group (Mongo).
+4. Multi-table: use explicit JOINs for SQL; $lookup for MongoDB.
+5. For PDF questions use search_pdf_library and cite the source.
+6. For charts: call the query tool first, then generate_chart with the results.
+7. Always use {CURRENCY_SYMBOL} for all monetary values.
+8. Column value discovery: when a WHERE filter value is unknown, FIRST run one
+   discovery query (SELECT DISTINCT col FROM tbl LIMIT 30 for SQL;
+   [{{"$group":{{"_id":"$field"}}}},{{"$limit":30}}] for Mongo).
+   Do this at most ONCE per column.
+9. Empty results: respond immediately with "No data found for [topic]".
+   Do NOT retry with different column names or spellings.
 10. Be concise.
 
 {user_ctx}"""
@@ -146,26 +176,56 @@ _SUGGESTIONS = [
     "Show top 10 items by price as a bar chart",
     "Show stock movement trend as a line chart",
     "What stock items are available?",
-    "Show stock distribution by category as a pie chart",
 ]
 
 
-# ── SQLDatabase singleton ──────────────────────────────────────────────────────
+# ── Attendance feature detection ───────────────────────────────────────────────
 
-_sql_db: SQLDatabase | None = None
+# ── SQLDatabase cache ──────────────────────────────────────────────────────────
+
+_sql_dbs: dict[str, SQLDatabase] = {}
 
 
-def _get_db() -> SQLDatabase:
-    global _sql_db
-    if _sql_db is None:
-        tables = get_table_config()
-        _sql_db = SQLDatabase.from_uri(
-            get_db_uri(),
-            include_tables=list(tables.values()),
-            sample_rows_in_table_info=0,
-        )
-        logger.info("SQLDatabase initialised with tables: %s", list(tables.values()))
-    return _sql_db
+def _get_sql_dbs() -> dict[str, SQLDatabase]:
+    """Return a {db_name: SQLDatabase} dict, creating instances lazily."""
+    from db.factory import build_sql_uri_for
+
+    for cfg in get_databases_config():
+        db_type = cfg["type"].lower()
+        if db_type not in ("mysql", "postgresql", "postgres", "pg"):
+            continue
+        name = cfg["name"]
+        if name not in _sql_dbs:
+            tables = get_db_tables(name)
+            try:
+                _sql_dbs[name] = SQLDatabase.from_uri(
+                    build_sql_uri_for(cfg),
+                    include_tables=list(tables.values()),
+                    sample_rows_in_table_info=0,
+                )
+                logger.info("SQLDatabase ready: %s → %s", name, list(tables.values()))
+            except Exception as exc:
+                logger.warning("SQLDatabase init failed for %s: %s", name, exc)
+
+    return _sql_dbs
+
+
+def invalidate_sql_db_cache() -> None:
+    """Discard cached SQLDatabase objects (call after schema sync)."""
+    global _sql_dbs
+    _sql_dbs = {}
+
+
+# ── Result size cap ────────────────────────────────────────────────────────────
+
+_SQL_MAX_CHARS = 20_000
+
+
+def _enforce_limit(query: str, default: int = 200) -> str:
+    """Append LIMIT {default} if the query has no LIMIT clause."""
+    if "LIMIT" not in query.upper():
+        return query.rstrip("; \n") + f" LIMIT {default}"
+    return query
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -181,16 +241,6 @@ def _extract_text(content) -> str:
 
 
 _SPECIAL_TOKENS = re.compile(r"<\|[a-zA-Z0-9_]+\|>")
-
-# Hard-cap on sql_query result size — backstop after LIMIT is already enforced.
-_SQL_MAX_CHARS = 20_000
-
-
-def _enforce_limit(query: str, default: int = 200) -> str:
-    """Append a default LIMIT if the query has none, preventing unbounded fetches."""
-    if "LIMIT" not in query.upper():
-        return query.rstrip("; \n") + f" LIMIT {default}"
-    return query
 
 def _clean(text: str) -> str:
     return _SPECIAL_TOKENS.sub("", text)
@@ -208,17 +258,14 @@ def _friendly_error(exc: Exception) -> str:
     if "AnthropicContextOverflowError" in type(exc).__name__ or "prompt is too long" in s:
         return (
             "The query returned too much data for the AI to process. "
-            "Try a more specific query — for example, add a date range filter or reduce the columns selected."
+            "Try a more specific query — add a date range filter or reduce the columns selected."
         )
     if "rate_limit_exceeded" in s or "429" in s:
         wait = re.search(r"try again in ([\w.]+)", s)
         wait_msg = f" Please try again in {wait.group(1)}." if wait else " Please try again shortly."
         return f"Rate limit reached for the AI model.{wait_msg}"
     if "failed_generation" in s or "Failed to call a function" in s:
-        return (
-            "The model failed to generate a valid tool call. "
-            "Try rephrasing or ask for simpler data."
-        )
+        return "The model failed to generate a valid tool call. Try rephrasing or ask for simpler data."
     if "insufficient_quota" in s or "credit" in s.lower():
         return "API credits exhausted. Please top up your account or switch providers in .env."
     if "timeout" in s.lower() or "timed out" in s.lower():
@@ -226,7 +273,7 @@ def _friendly_error(exc: Exception) -> str:
     return f"Error: {exc}"
 
 
-# ── Type coercions (Llama sends strings for bool/int/list params) ──────────────
+# ── Type coercions (Llama sends strings for bool/int/list) ─────────────────────
 
 def _to_bool(v) -> bool:
     if isinstance(v, bool):
@@ -251,59 +298,127 @@ def _parse_list(v, cast=str) -> list:
 
 # ── Tool factory ───────────────────────────────────────────────────────────────
 
-def _make_tools(user: dict | None, db: SQLDatabase) -> list:
+def _make_tools(user: dict | None) -> list:
+    sql_dbs  = _get_sql_dbs()
+    all_tools: list = []
 
-    @tool
-    def sql_query(query: str) -> str:
-        """Execute a SQL SELECT query on the business database.
+    for cfg in get_databases_config():
+        db_name = cfg["name"]
+        db_type = cfg["type"].lower()
+        desc    = cfg.get("description", db_name)
 
-        Use for any data question: sales, rankings, stock, inventory, employees.
-        Call sql_schema first when unsure about column names.
-        Use ORDER BY … LIMIT for top-N queries; GROUP BY + aggregates for summaries.
-        Write explicit JOIN queries using the relationships listed in the system prompt.
+        # ── SQL database tools ─────────────────────────────────────────────
+        if db_type in ("mysql", "postgresql", "postgres", "pg"):
+            db = sql_dbs.get(db_name)
+            if db is None:
+                logger.warning("Skipping tools for %s — SQLDatabase not available", db_name)
+                continue
 
-        IMPORTANT: if the result is empty, do NOT call this tool again with a different
-        query — report "No data found" to the user immediately.
+            tables = get_db_tables(db_name)
+            tables_str = ", ".join(tables.values())
 
-        Args:
-            query: A valid SQL SELECT or WITH statement.
-        """
-        stripped = query.strip()
-        upper = stripped.upper()
-        if not (upper.startswith("SELECT") or upper.startswith("WITH")):
-            return "Error: Only SELECT and WITH queries are permitted."
-        bounded = _enforce_limit(stripped)
-        if bounded != stripped:
-            logger.info("sql_query: no LIMIT found — appended LIMIT 200")
-        logger.info("sql_query: %s", bounded[:200])
-        try:
-            result = db.run(bounded)
-            if len(result) > _SQL_MAX_CHARS:
-                logger.warning("sql_query result still large (%d chars) — truncating", len(result))
-                result = (
-                    result[:_SQL_MAX_CHARS]
-                    + f"\n\n[Result truncated at {_SQL_MAX_CHARS} chars. "
-                    "Narrow the query (fewer columns, tighter date range) to see complete results.]"
-                )
-            return result
-        except Exception as exc:
-            logger.warning("sql_query failed: %s", exc)
-            return f"Query error: {exc}"
+            # query_{db_name}
+            def _make_sql_query(db_=db, name_=db_name, desc_=desc, tables_str_=tables_str):
+                @tool(f"query_{name_}", description=(
+                    f"Execute a SQL SELECT on {name_} — {desc_}. "
+                    f"Tables: {tables_str_}. "
+                    "Always include LIMIT. SELECT/WITH only. "
+                    "If the result is empty, report 'No data found' immediately. "
+                    "Args: query — a valid SQL SELECT or WITH statement."
+                ))
+                def sql_query(query: str) -> str:
+                    stripped = query.strip()
+                    if not stripped.upper().startswith(("SELECT", "WITH")):
+                        return "Error: Only SELECT and WITH queries are permitted."
+                    bounded = _enforce_limit(stripped)
+                    if bounded != stripped:
+                        logger.info("query_%s: appended LIMIT 200", name_)
+                    logger.info("query_%s: %s", name_, bounded[:200])
+                    try:
+                        result = db_.run(bounded)
+                        if len(result) > _SQL_MAX_CHARS:
+                            logger.warning("query_%s result truncated (%d chars)", name_, len(result))
+                            result = (
+                                result[:_SQL_MAX_CHARS]
+                                + f"\n\n[Result truncated. Add a tighter LIMIT or date filter.]"
+                            )
+                        return result
+                    except Exception as exc:
+                        logger.warning("query_%s failed: %s", name_, exc)
+                        return f"Query error: {exc}"
+                return sql_query
 
-    @tool
-    def sql_schema(table_names: str = "") -> str:
-        """Get column definitions for one or more database tables.
+            all_tools.append(_make_sql_query())
 
-        Call this before writing queries on unfamiliar tables.
+            # schema_{db_name}
+            def _make_sql_schema(db_=db, name_=db_name):
+                @tool(f"schema_{name_}", description=(
+                    f"Get column definitions for tables in {name_}. "
+                    "Call before writing queries on unfamiliar tables. "
+                    "Args: table_names — comma-separated table names, or empty for all tables."
+                ))
+                def sql_schema(table_names: str = "") -> str:
+                    if table_names.strip():
+                        tbls = [t.strip() for t in table_names.split(",")]
+                        return db_.get_table_info(tbls)
+                    return db_.get_table_info()
+                return sql_schema
 
-        Args:
-            table_names: Comma-separated table names, e.g. 'sales,products'.
-                         Leave empty to get schema for all available tables.
-        """
-        if table_names.strip():
-            tables = [t.strip() for t in table_names.split(",")]
-            return db.get_table_info(tables)
-        return db.get_table_info()
+            all_tools.append(_make_sql_schema())
+
+        # ── MongoDB tools ──────────────────────────────────────────────────
+        elif db_type == "mongodb":
+            import os as _os
+            collections = get_db_tables(db_name)
+            allowed     = set(collections.values())
+            mdb_name    = _os.getenv(f"{cfg['env_prefix']}_NAME", "")
+
+            def _make_mongo_query(cfg_=cfg, name_=db_name, desc_=desc,
+                                  allowed_=allowed, mdb_name_=mdb_name,
+                                  collections_=collections):
+                @tool(f"query_{name_}", description=(
+                    f"Query MongoDB {name_} — {desc_} using an aggregation pipeline. "
+                    f"Collections: {', '.join(collections_.values()) or '(none configured)'}. "
+                    "Args: collection — collection name; "
+                    "pipeline — JSON array e.g. [{\"$match\":{\"k\":\"v\"}},{\"$limit\":50}]. "
+                    "Always include a $limit stage. No $out or $merge."
+                ))
+                def mongo_query(collection: str, pipeline: str = "[]") -> str:
+                    if collection not in allowed_:
+                        return (
+                            f"Error: '{collection}' not available. "
+                            f"Choose from: {', '.join(allowed_)}"
+                        )
+                    try:
+                        pipe = json.loads(pipeline)
+                    except json.JSONDecodeError as e:
+                        return f"Error: invalid pipeline JSON — {e}"
+
+                    write_stages = {"$out", "$merge"}
+                    if any(write_stages & set(stage) for stage in pipe):
+                        return "Error: $out and $merge are not permitted."
+                    if not any("$limit" in stage for stage in pipe):
+                        pipe.append({"$limit": 200})
+
+                    try:
+                        from db.factory import build_mongo_client
+                        client = build_mongo_client(cfg_)
+                        docs   = list(client[mdb_name_][collection].aggregate(pipe))
+                        result = json.dumps(docs, default=str)
+                        if len(result) > _SQL_MAX_CHARS:
+                            logger.warning("query_%s result truncated (%d chars)", name_, len(result))
+                            result = result[:_SQL_MAX_CHARS] + "\n\n[Result truncated.]"
+                        logger.info("query_%s: %d doc(s) from %s", name_, len(docs), collection)
+                        return result
+                    except Exception as exc:
+                        logger.warning("query_%s failed: %s", name_, exc)
+                        return f"Query error: {exc}"
+
+                return mongo_query
+
+            all_tools.append(_make_mongo_query())
+
+    # ── Shared tools ───────────────────────────────────────────────────────────
 
     @tool
     def search_pdf_library(question: str, top_k: str = "3") -> str:
@@ -327,47 +442,9 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
             ],
         })
 
-    @tool
-    def mark_attendance(action: str) -> str:
-        """Record the current employee's check-in or check-out.
+    all_tools.append(search_pdf_library)
 
-        Use when the user says they are checking in/arriving or checking out/leaving.
-        Do NOT use sql_query for this — use this tool exclusively.
-
-        Args:
-            action: 'checkin' when arriving; 'checkout' when leaving.
-        """
-        if action not in ("checkin", "checkout"):
-            return json.dumps({"success": False, "message": "action must be 'checkin' or 'checkout'."})
-        if not user:
-            return json.dumps({"success": False, "message": "You must be logged in to mark attendance."})
-        result = db_mark_attendance(user["employee_id"], action)
-        return json.dumps({"success": result["status"] == "success", "message": result["message"]})
-
-    @tool
-    def get_attendance_report(all_employees: str = "false") -> str:
-        """Retrieve full attendance history for structured table display.
-
-        Use ONLY for plain unfiltered requests like "show my attendance" or
-        "show all attendance". This tool returns all records with no date or
-        status filtering.
-
-        For ANY filtered query — absent today, late this week, present in a
-        date range, by department, by name — use sql_query instead, which
-        supports precise WHERE conditions.
-
-        Args:
-            all_employees: 'true' for all employees (admin only); 'false' for own records.
-        """
-        want_all = _to_bool(all_employees)
-        if not user:
-            return json.dumps({"success": False, "message": "Login required."})
-        if want_all and user.get("role") != "admin":
-            return json.dumps({"success": False, "message": "Admin access required."})
-        records = db_get_attendance(employee_id=None if want_all else user["employee_id"])
-        return json.dumps({"success": True, "records": records})
-
-    # ── generate_chart ─────────────────────────────────────────────────────────
+    # ── Chart tool ─────────────────────────────────────────────────────────────
 
     class _ChartInput(BaseModel):
         chart_type:    str
@@ -404,30 +481,26 @@ def _make_tools(user: dict | None, db: SQLDatabase) -> list:
         args_schema=_ChartInput,
         description=(
             "Render a visual chart from query results. "
-            "Call AFTER sql_query when the user asks for a chart/graph/visualization.\n\n"
+            "Call AFTER a query tool when the user asks for a chart/graph/visualization.\n\n"
             "chart_type: 'bar' | 'line' | 'pie' | 'doughnut'\n"
             "labels: JSON array of category/time strings, e.g. '[\"Jan\",\"Feb\"]'\n"
             "data:   JSON array of matching numbers,       e.g. '[1200.5, 980.0]'"
         ),
     )
+    all_tools.append(generate_chart)
 
-    configured = get_table_config()
-    tool_list  = [sql_query, sql_schema, search_pdf_library, generate_chart]
-    if "attendance" in configured and "employees" in configured:
-        tool_list += [mark_attendance, get_attendance_report]
-    return tool_list
+    return all_tools
 
 
 # ── Streaming entry point ──────────────────────────────────────────────────────
 
 def stream_message(message: str, user: dict | None = None):
-    """
-    Generator yielding newline-delimited JSON events.
+    """Generator yielding newline-delimited JSON events.
 
     Event shapes:
-        {"status": "..."}                        — tool-running indicator
-        {"token": "..."}                         — streaming text token
-        {"done": true, "confidence": N}          — text complete
+        {"status": "..."}                         — tool-running indicator
+        {"token": "..."}                          — streaming text token
+        {"done": true, "confidence": N}           — text complete
         {"done": true, "data": {...}, "confidence": N} — structured response
     """
     user_ctx = (
@@ -439,13 +512,10 @@ def stream_message(message: str, user: dict | None = None):
     tracker = _ConfidenceTracker()
 
     try:
-        db    = _get_db()
-        tools = _make_tools(user, db)
+        tools = _make_tools(user)
         agent = create_react_agent(get_llm(), tools)
 
         tool_status_shown: set[str] = set()
-        attendance_action: dict | None = None
-        attendance_table:  list | None = None
         chart_data:        dict | None = None
 
         token_buffer:      list[str] = []
@@ -486,36 +556,20 @@ def stream_message(message: str, user: dict | None = None):
                         token_buffer.append(text)
 
             elif node == "tools" and isinstance(chunk, ToolMessage):
-                # ── confidence tracking ────────────────────────────────────
-                if chunk.name == "sql_query":
+                tool_name = chunk.name or ""
+
+                if tool_name.startswith("query_") or tool_name.startswith("schema_"):
                     tracker.record_sql(chunk.content)
 
-                elif chunk.name == "search_pdf_library":
+                elif tool_name == "search_pdf_library":
                     tracker.record_pdf(chunk.content)
 
-                elif chunk.name == "mark_attendance":
-                    try:
-                        attendance_action = json.loads(chunk.content)
-                        tracker.record_tool_success(attendance_action.get("success", False))
-                    except Exception:
-                        pass
-
-                elif chunk.name == "get_attendance_report":
-                    try:
-                        res = json.loads(chunk.content)
-                        tracker.record_tool_success(res.get("success", False))
-                        if res.get("success"):
-                            attendance_table = res["records"]
-                    except Exception:
-                        pass
-
-                elif chunk.name == "generate_chart":
+                elif tool_name == "generate_chart":
                     try:
                         chart_data = json.loads(chunk.content)
                     except Exception:
                         pass
 
-        # Flush last agent step if it was a plain text reply
         if not step_is_tool_call and token_buffer:
             for tok in token_buffer:
                 yield json.dumps({"token": tok}) + "\n"
@@ -523,25 +577,8 @@ def stream_message(message: str, user: dict | None = None):
         confidence = tracker.get()
         logger.info("Response confidence: %d%%", confidence)
 
-        # Emit final structured payload (priority: chart > attendance > text)
         if chart_data:
             yield json.dumps({"done": True, "data": chart_data, "confidence": confidence}) + "\n"
-        elif attendance_action:
-            yield json.dumps({
-                "done": True,
-                "data": {
-                    "type":    "attendance",
-                    "status":  "success" if attendance_action.get("success") else "error",
-                    "message": attendance_action.get("message", ""),
-                },
-                "confidence": confidence,
-            }) + "\n"
-        elif attendance_table is not None:
-            yield json.dumps({
-                "done": True,
-                "data": {"type": "attendance_table", "data": attendance_table},
-                "confidence": confidence,
-            }) + "\n"
         else:
             yield json.dumps({"done": True, "confidence": confidence}) + "\n"
 
@@ -557,7 +594,7 @@ def stream_message(message: str, user: dict | None = None):
         yield json.dumps({"done": True, "data": payload, "confidence": 0}) + "\n"
 
 
-# ── Synchronous wrapper (kept for compatibility) ───────────────────────────────
+# ── Synchronous wrapper ────────────────────────────────────────────────────────
 
 def process_message(message: str, user: dict | None = None) -> dict:
     last: dict = {"type": "error", "message": "No response."}
