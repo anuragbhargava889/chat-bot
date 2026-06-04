@@ -86,14 +86,43 @@ def get_db_tables(db_name: str) -> dict:
     return {}
 
 
+def _apply_descriptions(col_str: str, descriptions: dict[str, str]) -> str:
+    """Overlay {field: description} onto a column string.
+
+    Fields present in descriptions that don't already have a '(' annotation
+    get '(description)' appended. All other fields are left unchanged.
+    """
+    if not descriptions:
+        return col_str
+    entries = _parse_col_entries(col_str)
+    result = []
+    for name, entry in entries.items():
+        if name in descriptions and "(" not in entry:
+            result.append(f"{name}({descriptions[name]})")
+        else:
+            result.append(entry)
+    return ", ".join(result)
+
+
 def get_db_columns(db_name: str) -> dict:
-    """Return optional column/field hints for a database (auto-generated)."""
+    """Return column/field hints for a database, with manual descriptions overlaid."""
+    cols: dict[str, str] = {}
     for fname in ("table_columns.json", "collection_columns.json"):
         try:
-            return _load_db_json(db_name, fname)
+            cols = _load_db_json(db_name, fname)
+            break
         except FileNotFoundError:
             continue
-    return {}
+
+    try:
+        descriptions = _load_db_json(db_name, "column_descriptions.json")
+    except FileNotFoundError:
+        return cols
+
+    return {
+        logical: _apply_descriptions(col_str, descriptions.get(logical, {}))
+        for logical, col_str in cols.items()
+    }
 
 
 def get_db_relationships(db_name: str) -> list:
@@ -103,6 +132,67 @@ def get_db_relationships(db_name: str) -> list:
         return data.get("relationships", []) if isinstance(data, dict) else []
     except FileNotFoundError:
         return []
+
+
+# ── Column-hint merge helpers ──────────────────────────────────────────────────
+
+def _parse_col_entries(col_str: str) -> dict[str, str]:
+    """Parse a hybrid column string into {field_name: full_entry}.
+
+    Handles inline descriptions: 'field1, field2(desc), field3' →
+    {'field1': 'field1', 'field2': 'field2(desc)', 'field3': 'field3'}.
+    Paren-depth tracking lets descriptions contain nested parens safely.
+    Returns {} for empty or whitespace-only input.
+    """
+    entries: dict[str, str] = {}
+    depth = 0
+    current = ""
+    for ch in col_str:
+        if ch == "(":
+            depth += 1
+            current += ch
+        elif ch == ")":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            entry = current.strip()
+            if entry:
+                name = entry.split("(")[0].strip()
+                if name:
+                    entries[name] = entry
+            current = ""
+        else:
+            current += ch
+    entry = current.strip()
+    if entry:
+        name = entry.split("(")[0].strip()
+        if name:
+            entries[name] = entry
+    return entries
+
+
+def _merge_col_hints(existing_str: str, discovered_str: str) -> str:
+    """Merge auto-discovered plain field names with existing annotated entries.
+
+    - Fields present in both: keep the existing entry (preserving any description).
+    - Fields only in discovered: append as plain names (new columns).
+    - Fields only in existing: drop them (column removed from DB).
+    - If existing_str is empty/blank: return discovered_str unchanged.
+    """
+    if not existing_str or not existing_str.strip():
+        return discovered_str
+    existing = _parse_col_entries(existing_str)
+    discovered_names = [f.strip() for f in discovered_str.split(",") if f.strip()]
+    discovered_set = set(discovered_names)
+    result: list[str] = []
+    for name, entry in existing.items():
+        if name in discovered_set:
+            result.append(entry)
+    existing_names = set(existing.keys())
+    for field in discovered_names:
+        if field not in existing_names:
+            result.append(field)
+    return ", ".join(result)
 
 
 # ── Schema sync ────────────────────────────────────────────────────────────────
@@ -130,13 +220,19 @@ def sync_db_schema(db_cfg: dict) -> dict:
         from db.factory import build_adapter_for
         adapter = build_adapter_for(db_cfg)
 
-        # ── column hints (fully auto) ──────────────────────────────────────
+        # ── column hints (hybrid merge — preserves inline descriptions) ──────
         raw_cols = discover_columns_sql(adapter, list(tables.values()))
-        logical_cols = {
-            logical: raw_cols[actual]
-            for logical, actual in tables.items()
-            if actual in raw_cols
-        }
+        try:
+            existing_cols = _load_db_json(db_name, "table_columns.json")
+        except FileNotFoundError:
+            existing_cols = {}
+        logical_cols = {}
+        for logical, actual in tables.items():
+            if actual not in raw_cols:
+                continue
+            logical_cols[logical] = _merge_col_hints(
+                existing_cols.get(logical, ""), raw_cols[actual]
+            )
         _save_db_json(db_name, "table_columns.json", logical_cols)
         _log.info("Synced columns for %s: %d table(s)", db_name, len(logical_cols))
 
@@ -167,8 +263,16 @@ def sync_db_schema(db_cfg: dict) -> dict:
         client   = build_mongo_client(db_cfg)
         mdb_name = os.getenv(f"{db_cfg['env_prefix']}_NAME", "")
         col_hints = discover_columns_mongo(client, mdb_name, tables)
-        _save_db_json(db_name, "collection_columns.json", col_hints)
-        _log.info("Synced fields for %s: %d collection(s)", db_name, len(col_hints))
+        try:
+            existing_cols = _load_db_json(db_name, "collection_columns.json")
+        except FileNotFoundError:
+            existing_cols = {}
+        merged_hints = {
+            logical: _merge_col_hints(existing_cols.get(logical, ""), discovered)
+            for logical, discovered in col_hints.items()
+        }
+        _save_db_json(db_name, "collection_columns.json", merged_hints)
+        _log.info("Synced fields for %s: %d collection(s)", db_name, len(merged_hints))
         return {"collections": len(tables)}
 
     _log.warning("sync_db_schema: unknown type %r for %s", db_type, db_name)
