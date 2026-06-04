@@ -1,4 +1,6 @@
 {
-    "tstock_movement":"tstock_movement",
-    "tuser_stock":    "tuser_stock"
+    "tstock_movement": "tstock_movement",
+    "tuser_stock": "tuser_stock",
+    "daily_primary_vol": "daily_primary_vol",
+    "orders": "orders"
 }

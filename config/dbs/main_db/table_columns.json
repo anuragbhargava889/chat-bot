@@ -1,4 +1,0 @@
-{
-  "stock_movement": "from_role, to_role, status, movement_type, item_price, sales_price, imei, material_code, dbr_code, moved_date",
-  "user_stock":     "model_no, model_name, item_main_category, series, imei1, imei2, each_line_item_price, invoice_no, dbr_name, status, quantity, stock_date"
-}
