@@ -1,9 +1,49 @@
 {
   "tstock_movement": {
+    "moved_date": "date stock was moved — string YYYY-MM-DD",
+    "moved_datetime": "exact datetime stock moved — string YYYY-MM-DDTHH:MM:SS",
+    "received_date": "date stock was received — string YYYY-MM-DD",
+    "activation_date": "date device was activated — string YYYY-MM-DD"
   },
   "tuser_stock": {
+    "stock_date": "date stock was recorded — string YYYY-MM-DD",
+    "date_of_invoice": "invoice date — string YYYY-MM-DD",
+    "delivery_note_date": "delivery note date — string YYYY-MM-DD",
+    "goods_receipt_date": "goods receipt date — string YYYY-MM-DD"
   },
   "daily_primary_vol": {
+    "bill_date": "invoice/billing date stored as ISODate object — use {\"$date\":\"YYYY-MM-DDTHH:MM:SSZ\"} in filters",
+    "bill_num": "invoice / billing document number",
+    "bill_item": "line item position number within the invoice",
+    "bill_qty": "quantity billed on the invoice",
+    "bill_type": "billing document type e.g. F2=standard invoice, credit note, debit note",
+    "inv_qty": "invoiced quantity (may differ from bill_qty for returns/adjustments)",
+    "netval_inv": "net invoice value — primary billing/revenue amount in rupees",
+    "price": "unit selling price per item",
+    "tax_amount": "GST / tax amount on the invoice",
+    "tcs": "Tax Collected at Source amount (Indian TCS)",
+    "subtotal_5": "SAP pricing subtotal condition 5",
+    "dbr_code": "distributor code — unique ID of the distributor/dealer",
+    "dm_code": "District Manager code",
+    "zm_code": "Zonal Manager code — use this to identify or group by Zonal Manager",
+    "bu_head": "Business Unit head code",
+    "business_unit": "business unit name e.g. EAST, WEST, NORTH, SOUTH, CENTRAL",
+    "ter_code": "territory code",
+    "sales_dist": "sales district code",
+    "branch_code": "company branch office code",
+    "plant": "supply warehouse / plant code",
+    "stor_loc": "storage location code within the plant",
+    "material_code": "product SKU / material code",
+    "model_code": "product model code — use for model-level sales analysis",
+    "matl_group": "material / product group category",
+    "category": "product category",
+    "series": "product series or line",
+    "colour": "product colour variant",
+    "account_group": "customer account group / classification",
+    "cust_group": "customer group / tier",
+    "week_name": "week label e.g. W01 W02",
+    "week_no": "week number of the year",
+    "created_on": "record creation date"
   },
   "orders": {
   }

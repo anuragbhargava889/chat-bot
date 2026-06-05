@@ -154,16 +154,16 @@ Rules:
    Mongo: Write an aggregation pipeline JSON array. Always include a $limit stage.
           Never use $out or $merge.
 2. {date_hint}
-3. MongoDB date fields are stored as ISO strings ("YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS").
-   Use string $gte/$lte for all date filtering — never use $year/$month/$dayOfMonth operators.
+3. MongoDB date fields — check the field description to know the storage format:
+   - ISODate fields (e.g. daily_primary_vol.bill_date): use {{"$date":"YYYY-MM-DDTHH:MM:SSZ"}}
+   - String date fields (e.g. tstock_movement.moved_date, tuser_stock.stock_date): use plain "YYYY-MM-DD" strings
    Date range rules — only add bounds that the question explicitly mentions:
-     "in YYYY"              → {{"$gte":"YYYY-01-01","$lt":"(YYYY+1)-01-01"}}
-     "up to / till Mon YYYY"→ {{"$lte":"YYYY-MM-last_day"}}  ← NO lower bound unless stated
-     "from Mon YYYY"        → {{"$gte":"YYYY-MM-01"}}        ← NO upper bound unless stated
-     "before YYYY"          → {{"$lt":"YYYY-01-01"}}
-     "last 90 days"         → {{"$gte":"<today minus 90 days as YYYY-MM-DD>"}}
-     "last quarter"         → compute calendar quarter start/end from today, use $gte and $lte
-     "Month YYYY"           → {{"$gte":"YYYY-MM-01","$lt":"YYYY-(MM+1)-01"}}
+     ISODate "in YYYY"        → {{"$gte":{{"$date":"YYYY-01-01T00:00:00Z"}},"$lt":{{"$date":"(YYYY+1)-01-01T00:00:00Z"}}}}
+     ISODate "up to Mon YYYY" → {{"$lte":{{"$date":"YYYY-MM-last_dayT23:59:59Z"}}}}  ← NO lower bound unless stated
+     ISODate "last 90 days"   → {{"$gte":{{"$date":"<today-90days>T00:00:00Z"}}}}
+     String  "in YYYY"        → {{"$gte":"YYYY-01-01","$lt":"(YYYY+1)-01-01"}}
+     String  "up to Mon YYYY" → {{"$lte":"YYYY-MM-last_day"}}                        ← NO lower bound unless stated
+     String  "last 90 days"   → {{"$gte":"<today-90days as YYYY-MM-DD>"}}
 4. Rankings : ORDER BY … LIMIT N (SQL) | $sort + $limit (Mongo).
    Summaries: GROUP BY + aggregates (SQL) | $group (Mongo).
 5. Multi-table: use explicit JOINs for SQL; $lookup for MongoDB.
