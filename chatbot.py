@@ -140,7 +140,10 @@ def _build_system(user_ctx: str) -> str:
     else:
         date_hint = ""
 
+    today = datetime.now().strftime("%Y-%m-%d")
+
     return f"""You are a company assistant with access to one or more databases and a PDF library.
+Today's date: {today}
 
 Databases:
 {databases_str}
@@ -151,19 +154,26 @@ Rules:
    Mongo: Write an aggregation pipeline JSON array. Always include a $limit stage.
           Never use $out or $merge.
 2. {date_hint}
-3. Rankings : ORDER BY … LIMIT N (SQL) | $sort + $limit (Mongo).
+3. MongoDB date fields are stored as ISO strings ("YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS").
+   Use string $gte/$lte for all date filtering — never use $year/$month/$dayOfMonth operators.
+   Examples:
+     Year 2026      → {{"$gte":"2026-01-01","$lt":"2027-01-01"}}
+     Last 90 days   → compute (today - 90 days) as "YYYY-MM-DD", use {{"$gte":"<date>"}}
+     Last quarter   → compute the calendar quarter start/end from today and use $gte/$lte
+     Specific month → {{"$gte":"2026-03-01","$lt":"2026-04-01"}}
+4. Rankings : ORDER BY … LIMIT N (SQL) | $sort + $limit (Mongo).
    Summaries: GROUP BY + aggregates (SQL) | $group (Mongo).
-4. Multi-table: use explicit JOINs for SQL; $lookup for MongoDB.
-5. For PDF questions use search_pdf_library and cite the source.
-6. For charts: call the query tool first, then generate_chart with the results.
-7. Always use {CURRENCY_SYMBOL} for all monetary values.
-8. Column value discovery: when a WHERE filter value is unknown, FIRST run one
+5. Multi-table: use explicit JOINs for SQL; $lookup for MongoDB.
+6. For PDF questions use search_pdf_library and cite the source.
+7. For charts: call the query tool first, then generate_chart with the results.
+8. Always use {CURRENCY_SYMBOL} for all monetary values.
+9. Column value discovery: when a WHERE filter value is unknown, FIRST run one
    discovery query (SELECT DISTINCT col FROM tbl LIMIT 30 for SQL;
    [{{"$group":{{"_id":"$field"}}}},{{"$limit":30}}] for Mongo).
    Do this at most ONCE per column.
-9. Empty results: respond immediately with "No data found for [topic]".
-   Do NOT retry with different column names or spellings.
-10. Be concise.
+10. Empty results: respond immediately with "No data found for [topic]".
+    Do NOT retry with different column names or spellings.
+11. Be concise.
 
 {user_ctx}"""
 
@@ -402,13 +412,14 @@ def _make_tools(user: dict | None) -> list:
 
                     try:
                         from db.factory import build_mongo_client
+                        logger.info("query_%s on %s — pipeline: %s", name_, collection, pipeline[:600])
                         client = build_mongo_client(cfg_)
                         docs   = list(client[mdb_name_][collection].aggregate(pipe))
                         result = json.dumps(docs, default=str)
                         if len(result) > _SQL_MAX_CHARS:
                             logger.warning("query_%s result truncated (%d chars)", name_, len(result))
                             result = result[:_SQL_MAX_CHARS] + "\n\n[Result truncated.]"
-                        logger.info("query_%s: %d doc(s) from %s", name_, len(docs), collection)
+                        logger.info("query_%s: %d doc(s) returned from %s", name_, len(docs), collection)
                         return result
                     except Exception as exc:
                         logger.warning("query_%s failed: %s", name_, exc)
