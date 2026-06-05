@@ -92,7 +92,7 @@ def _apply_descriptions(col_str: str, descriptions: dict[str, str]) -> str:
     Fields present in descriptions that don't already have a '(' annotation
     get '(description)' appended. All other fields are left unchanged.
     """
-    if not descriptions:
+    if not descriptions or not isinstance(descriptions, dict):
         return col_str
     entries = _parse_col_entries(col_str)
     result = []
@@ -116,6 +116,8 @@ def get_db_columns(db_name: str) -> dict:
 
     try:
         descriptions = _load_db_json(db_name, "column_descriptions.json")
+        if not isinstance(descriptions, dict):
+            return cols
     except FileNotFoundError:
         return cols
 
