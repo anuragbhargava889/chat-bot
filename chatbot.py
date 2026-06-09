@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
@@ -175,7 +175,7 @@ Rules:
    [{{"$group":{{"_id":"$field"}}}},{{"$limit":30}}] for Mongo).
    Do this at most ONCE per column.
 10. Empty results: say "No data found for [topic]" and show the exact $match filter you used.
-    Do NOT speculate about why data is missing. Do NOT retry with different field names.
+    Do NOT retry with a different filter, format, or field name. One attempt only.
 11. Be concise.
 
 {user_ctx}"""
@@ -309,6 +309,27 @@ def _parse_list(v, cast=str) -> list:
         return [cast(x) for x in parts if x]
 
 
+# ── Pipeline helpers ──────────────────────────────────────────────────────────
+
+def _convert_extended_json(obj):
+    """Recursively convert Extended JSON {"$date":"ISO"} to Python datetime.
+
+    json.loads() treats {"$date":"..."} as a plain dict; pymongo then sends it
+    as a BSON sub-document instead of a Date, so date comparisons return nothing.
+    This converts them to real datetime objects before the pipeline is executed.
+    """
+    if isinstance(obj, dict):
+        if list(obj.keys()) == ["$date"] and isinstance(obj["$date"], str):
+            try:
+                return datetime.fromisoformat(obj["$date"].replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                pass
+        return {k: _convert_extended_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_extended_json(item) for item in obj]
+    return obj
+
+
 # ── Tool factory ───────────────────────────────────────────────────────────────
 
 def _make_tools(user: dict | None) -> list:
@@ -403,7 +424,7 @@ def _make_tools(user: dict | None) -> list:
                             f"Choose from: {', '.join(allowed_)}"
                         )
                     try:
-                        pipe = json.loads(pipeline)
+                        pipe = _convert_extended_json(json.loads(pipeline))
                     except json.JSONDecodeError as e:
                         return f"Error: invalid pipeline JSON — {e}"
 
