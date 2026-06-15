@@ -45,6 +45,34 @@
     "week_no": "week number of the year",
     "created_on": "record creation date"
   },
+  "daily_secondary_vol": {
+    "secondary_date": "secondary sales date — ISODate object, use {\"$date\":\"YYYY-MM-DDTHH:MM:SSZ\"} in filters",
+    "created_on": "record creation date — ISODate object",
+    "NET_VALUE": "net value as string — do NOT use for SUM/aggregation, use 'value' field instead",
+    "value": "numeric net sales value — use this for SUM and revenue calculations",
+    "qty": "quantity sold",
+    "price": "unit price",
+    "retailer_code": "retailer unique code",
+    "fos_code": "Field Officer / Sales rep code",
+    "dbr_code": "distributor code",
+    "dm_code": "District Manager code",
+    "zm_code": "Zonal Manager code — use for Zonal Manager grouping and analysis",
+    "bu_head": "Business Unit head code",
+    "business_unit": "business unit name e.g. EAST, WEST, NORTH, SOUTH, CENTRAL",
+    "ter_code": "territory code",
+    "branch_code": "branch office code",
+    "material_code": "product SKU / material code",
+    "model_code": "product model code — use for model-level sales analysis",
+    "series": "product series or line",
+    "category": "product category",
+    "colour": "product colour variant",
+    "account_group": "customer account group / classification",
+    "week_name": "week label e.g. Wk23",
+    "week_no": "week number of the year",
+    "return": "return reason code — empty string means no return",
+    "io_reson": "internal order reason code",
+    "is_nonsl": "1 if non-sellable item, 0 if normal sellable stock"
+  },
   "orders": {
   }
 }
