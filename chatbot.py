@@ -41,15 +41,19 @@ logger = logging.getLogger(__name__)
 
 class _ConfidenceTracker:
     def __init__(self):
-        self._score: float = 85.0
+        self._score:         float = 85.0
+        self._empty_count:   int   = 0
+        self._success_count: int   = 0
 
     def record_sql(self, result: str) -> None:
         r = result.strip()
         if r.startswith("Query error:") or r.startswith("Error:"):
             self._score -= 35
         elif not r or r in ("[]", "None", ""):
+            self._empty_count += 1
             self._score -= 20
         else:
+            self._success_count += 1
             self._score = min(98, self._score + 5)
 
     def record_pdf(self, result_json: str) -> None:
@@ -58,6 +62,7 @@ class _ConfidenceTracker:
             if res.get("found") and res.get("chunks"):
                 avg_rel = sum(c.get("relevance", 0.5) for c in res["chunks"]) / len(res["chunks"])
                 self._score = min(98, self._score + (avg_rel - 0.5) * 12)
+                self._success_count += 1
             else:
                 self._score -= 15
         except Exception:
@@ -68,7 +73,14 @@ class _ConfidenceTracker:
             self._score -= 10
 
     def get(self) -> int:
-        return round(max(10, min(98, self._score)))
+        score = self._score
+        # Recover penalty for intermediate empty results when we ultimately got data.
+        # Multi-step exploration (discovery query → real query) is normal agent behaviour;
+        # penalising it the same as a final "no data" result misrepresents answer quality.
+        if self._success_count > 0 and self._empty_count > 0:
+            recovery = min(self._empty_count, self._success_count) * 15
+            score = min(98, score + recovery)
+        return round(max(10, min(98, score)))
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -170,13 +182,19 @@ Rules:
 6. For PDF questions use search_pdf_library and cite the source.
 7. For charts: call the query tool first, then generate_chart with the results.
 8. Always use {CURRENCY_SYMBOL} for all monetary values.
-9. Column value discovery: when a WHERE filter value is unknown, FIRST run one
-   discovery query (SELECT DISTINCT col FROM tbl LIMIT 30 for SQL;
+9. String name matching: product/item names typed by users may differ from stored values
+   in case or spacing (e.g. user types "lava fusion" but DB stores "LAVA_FUSION").
+   Always use case- and separator-insensitive matching for name filters:
+     SQL  : WHERE REPLACE(UPPER(col), '_', ' ') = UPPER('user value')
+     Mongo: {{"$expr":{{"$eq":[{{"$toUpper":{{"$replaceAll":{{"input":"$field","find":"_","replacement":" "}}}}}},{{"$toUpper":"user value"}}]}}}}
+   Never do a plain equality match like col = 'lava fusion' on name-like columns.
+10. Column value discovery: when unsure how a value is stored, run one discovery query
+   (SELECT DISTINCT col FROM tbl LIMIT 30 for SQL;
    [{{"$group":{{"_id":"$field"}}}},{{"$limit":30}}] for Mongo).
-   Do this at most ONCE per column.
-10. Empty results: say "No data found for [topic]" and show the exact $match filter you used.
+   Do this at most ONCE per column, then use the exact stored value.
+11. Empty results: say "No data found for [topic]" and show the exact filter you used.
     Do NOT retry with a different filter, format, or field name. One attempt only.
-11. Be concise.
+12. Be concise.
 
 {user_ctx}"""
 
