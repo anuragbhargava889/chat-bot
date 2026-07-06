@@ -376,6 +376,27 @@
     });
   }
 
+  // ── new chat ──────────────────────────────────────────────────────────────
+
+  const newChatBtn = document.getElementById('new-chat-btn');
+  if (newChatBtn) {
+    newChatBtn.addEventListener('click', async () => {
+      try {
+        await fetch('/api/clear-chat', { method: 'POST' });
+      } catch { /* ignore network errors */ }
+      // Reset the message list to the initial greeting.
+      messagesEl.innerHTML = `
+        <div class="message bot">
+          <div class="bubble">
+            Hello, <strong>${escHtml(document.querySelector('.user-name')?.textContent || '')}</strong>! How can I help you today?<br/>
+            Type <strong>help</strong> to see what I can do.
+          </div>
+        </div>`;
+      input.value = '';
+      input.focus();
+    });
+  }
+
   // ── PDF list sidebar ──────────────────────────────────────────────────────
 
   async function loadPdfList() {

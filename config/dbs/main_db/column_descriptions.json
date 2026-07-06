@@ -3,7 +3,8 @@
     "moved_date": "date stock was moved — string YYYY-MM-DD",
     "moved_datetime": "exact datetime stock moved — string YYYY-MM-DDTHH:MM:SS",
     "received_date": "date stock was received — string YYYY-MM-DD",
-    "activation_date": "date device was activated — string YYYY-MM-DD"
+    "activation_date": "date device was activated — string YYYY-MM-DD",
+    "status": "movement status — case is inconsistent in stored data (e.g. 'Acknowledged' and 'acknowledged' are the same value); normalize with UPPER()/$toUpper before grouping"
   },
   "tuser_stock": {
     "stock_date": "date stock was recorded — string YYYY-MM-DD",
@@ -38,7 +39,7 @@
     "matl_group": "material / product group category",
     "category": "product category",
     "series": "product series or line",
-    "colour": "product colour variant",
+    "colour": "product colour variant — case is inconsistent in stored data (e.g. 'Black' and 'BLACK' are the same value); normalize with UPPER()/$toUpper before grouping",
     "account_group": "customer account group / classification",
     "cust_group": "customer group / tier",
     "week_name": "week label e.g. W01 W02",
@@ -65,7 +66,7 @@
     "model_code": "product model code — use for model-level sales analysis",
     "series": "product series or line",
     "category": "product category",
-    "colour": "product colour variant",
+    "colour": "product colour variant — case is inconsistent in stored data (e.g. 'Black', 'BLACK', 'black' all appear); normalize with UPPER()/$toUpper before grouping",
     "account_group": "customer account group / classification",
     "week_name": "week label e.g. Wk23",
     "week_no": "week number of the year",
@@ -74,5 +75,10 @@
     "is_nonsl": "1 if non-sellable item, 0 if normal sellable stock"
   },
   "orders": {
+  },
+  "distributor": {
+    "id": "sequential numeric identifier for the distributor row",
+    "distributor_code": "distributor code, zero-padded to 10 digits — matches dbr_code in daily_primary_vol/daily_secondary_vol/tstock_movement. NOTE: tuser_stock.dbr_code stores the same code WITHOUT zero-padding (e.g. '300729' vs '0000300729') — strip leading zeros before comparing against tuser_stock",
+    "distributor_name": "human-readable distributor / dealer name. Only a small subset of distributor_code values currently have a known name — most will not find a match here"
   }
 }

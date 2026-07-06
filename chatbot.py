@@ -19,7 +19,7 @@ import re
 from datetime import datetime, timezone
 
 from langchain_community.utilities import SQLDatabase
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool, tool
 from langgraph.prebuilt import create_react_agent
 from pydantic import BaseModel, field_validator
@@ -188,6 +188,14 @@ Rules:
      SQL  : WHERE REPLACE(UPPER(col), '_', ' ') = UPPER('user value')
      Mongo: {{"$expr":{{"$eq":[{{"$toUpper":{{"$replaceAll":{{"input":"$field","find":"_","replacement":" "}}}}}},{{"$toUpper":"user value"}}]}}}}
    Never do a plain equality match like col = 'lava fusion' on name-like columns.
+9b. Case-inconsistent grouping: text/categorical columns (e.g. colour, status, category,
+   business_unit) often mix case in the raw data itself (e.g. "Black" and "BLACK" are the
+   SAME value, stored inconsistently) — grouping on the raw field splits them into duplicate
+   buckets. Always normalize case in GROUP BY / $group on text columns:
+     SQL  : GROUP BY UPPER(col)   — and SELECT UPPER(col) AS col for the label
+     Mongo: {{"$group":{{"_id":{{"$toUpper":"$field"}}, ...}}}}
+   Numeric/code/date columns (dbr_code, quantity, dates) do not need this — only free-text
+   categorical columns.
 10. Column value discovery: when unsure how a value is stored, run one discovery query
    (SELECT DISTINCT col FROM tbl LIMIT 30 for SQL;
    [{{"$group":{{"_id":"$field"}}}},{{"$limit":30}}] for Mongo).
@@ -195,6 +203,12 @@ Rules:
 11. Empty results: say "No data found for [topic]" and show the exact filter you used.
     Do NOT retry with a different filter, format, or field name. One attempt only.
 12. Be concise.
+13. Read-only assistant: if the user asks to insert, update, delete, remove, drop, modify,
+    or otherwise change/write any data (e.g. "delete this order", "update the distributor
+    name", "add a new record"), do NOT call any query tool — not even with SELECT-only
+    stages as a workaround. Reply immediately with a short message stating that you are
+    read-only and cannot modify data, and that changes must be made directly in the
+    database. This applies even if the user insists or rephrases the request.
 
 {user_ctx}"""
 
@@ -381,7 +395,7 @@ def _make_tools(user: dict | None) -> list:
                 def sql_query(query: str) -> str:
                     stripped = query.strip()
                     if not stripped.upper().startswith(("SELECT", "WITH")):
-                        return "Error: Only SELECT and WITH queries are permitted."
+                        return "Error: This assistant is read-only — only SELECT and WITH queries are permitted. Data cannot be inserted, updated, or deleted."
                     bounded = _enforce_limit(stripped)
                     if bounded != stripped:
                         logger.info("query_%s: appended LIMIT 200", name_)
@@ -448,7 +462,7 @@ def _make_tools(user: dict | None) -> list:
 
                     write_stages = {"$out", "$merge"}
                     if any(write_stages & set(stage) for stage in pipe):
-                        return "Error: $out and $merge are not permitted."
+                        return "Error: This assistant is read-only — $out and $merge are not permitted. Data cannot be inserted, updated, or deleted."
                     if not any("$limit" in stage for stage in pipe):
                         pipe.append({"$limit": 200})
 
@@ -545,9 +559,19 @@ def _make_tools(user: dict | None) -> list:
     return all_tools
 
 
+# ── Conversation history ───────────────────────────────────────────────────────
+
+_MAX_HISTORY_TURNS = 10  # keep last N human+AI pairs (2*N messages)
+_chat_histories: dict[str, list] = {}
+
+
+def clear_history(thread_id: str) -> None:
+    _chat_histories.pop(thread_id, None)
+
+
 # ── Streaming entry point ──────────────────────────────────────────────────────
 
-def stream_message(message: str, user: dict | None = None):
+def stream_message(message: str, user: dict | None = None, thread_id: str | None = None):
     """Generator yielding newline-delimited JSON events.
 
     Event shapes:
@@ -563,6 +587,7 @@ def stream_message(message: str, user: dict | None = None):
     )
 
     tracker = _ConfidenceTracker()
+    history = _chat_histories.get(thread_id, []) if thread_id else []
 
     try:
         tools = _make_tools(user)
@@ -572,12 +597,14 @@ def stream_message(message: str, user: dict | None = None):
         chart_data:        dict | None = None
 
         token_buffer:      list[str] = []
+        accumulated_text:  list[str] = []
         current_step:      int  = -1
         step_is_tool_call: bool = False
 
         for chunk, metadata in agent.stream(
             {"messages": [
                 SystemMessage(content=_build_system(user_ctx)),
+                *history,
                 HumanMessage(content=message),
             ]},
             {"recursion_limit": 10},
@@ -590,6 +617,7 @@ def stream_message(message: str, user: dict | None = None):
                 if step != current_step:
                     if current_step >= 0 and not step_is_tool_call:
                         for tok in token_buffer:
+                            accumulated_text.append(tok)
                             yield json.dumps({"token": tok}) + "\n"
                     token_buffer      = []
                     step_is_tool_call = False
@@ -625,7 +653,14 @@ def stream_message(message: str, user: dict | None = None):
 
         if not step_is_tool_call and token_buffer:
             for tok in token_buffer:
+                accumulated_text.append(tok)
                 yield json.dumps({"token": tok}) + "\n"
+
+        # Persist conversation turn so follow-up questions have context.
+        if thread_id and accumulated_text:
+            ai_text = "".join(accumulated_text)
+            updated = history + [HumanMessage(content=message), AIMessage(content=ai_text)]
+            _chat_histories[thread_id] = updated[-(2 * _MAX_HISTORY_TURNS):]
 
         confidence = tracker.get()
         logger.info("Response confidence: %d%%", confidence)

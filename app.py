@@ -1,9 +1,10 @@
 import hashlib
 import logging
+import uuid
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
 
-from chatbot import invalidate_sql_db_cache, stream_message
+from chatbot import clear_history, invalidate_sql_db_cache, stream_message
 from config import SECRET_KEY, CURRENCY_SYMBOL
 from database import get_employee_by_username
 from pdf_handler import get_pdf_list, load_pdfs
@@ -86,6 +87,9 @@ def login():
 
 @app.route("/logout")
 def logout():
+    thread_id = session.get("chat_thread_id")
+    if thread_id:
+        clear_history(thread_id)
     session.clear()
     return redirect(url_for("login"))
 
@@ -105,14 +109,31 @@ def chat():
 
     user = _current_user()
 
+    if "chat_thread_id" not in session:
+        session["chat_thread_id"] = str(uuid.uuid4())
+    thread_id = session["chat_thread_id"]
+
     def generate():
-        yield from stream_message(message, user)
+        yield from stream_message(message, user, thread_id)
 
     return Response(
         stream_with_context(generate()),
         mimetype="application/x-ndjson",
         headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
+
+
+@app.route("/api/clear-chat", methods=["POST"])
+def clear_chat():
+    redir = _require_login()
+    if redir:
+        return jsonify({"error": "Not authenticated."}), 401
+    thread_id = session.get("chat_thread_id")
+    if thread_id:
+        clear_history(thread_id)
+    # Issue a new thread ID so the next message starts a fresh conversation.
+    session["chat_thread_id"] = str(uuid.uuid4())
+    return jsonify({"message": "Chat history cleared."})
 
 
 @app.route("/api/pdfs")

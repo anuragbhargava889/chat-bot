@@ -6,6 +6,27 @@
       "left_key": "imei",
       "right_key": "imei1",
       "join_type": "LEFT"
+    },
+    {
+      "left_table": "daily_primary_vol",
+      "right_table": "distributor",
+      "left_key": "dbr_code",
+      "right_key": "distributor_code",
+      "join_type": "LEFT"
+    },
+    {
+      "left_table": "daily_secondary_vol",
+      "right_table": "distributor",
+      "left_key": "dbr_code",
+      "right_key": "distributor_code",
+      "join_type": "LEFT"
+    },
+    {
+      "left_table": "tstock_movement",
+      "right_table": "distributor",
+      "left_key": "dbr_code",
+      "right_key": "distributor_code",
+      "join_type": "LEFT"
     }
   ]
 }

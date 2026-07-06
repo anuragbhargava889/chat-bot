@@ -3,5 +3,6 @@
     "tuser_stock": "tuser_stock",
     "daily_primary_vol": "daily_primary_vol",
     "daily_secondary_vol": "daily_secondary_vol",
-    "orders": "orders"
+    "orders": "orders",
+    "distributor": "distributor"
 }

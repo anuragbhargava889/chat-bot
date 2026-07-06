@@ -101,6 +101,8 @@ html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; font-
 .quick-btn:hover { background: var(--primary-light); border-color: var(--primary); color: var(--primary); }
 .admin-btn { color: var(--warn); border-color: #fcd34d; }
 .admin-btn:hover { background: #fffbeb; }
+.new-chat-btn { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; margin-bottom: .4rem; }
+.new-chat-btn:hover { background: #4338ca; border-color: #4338ca; color: #fff; }
 
 .sidebar-pdfs { flex: 1; min-height: 0; }
 .pdf-list { list-style: none; display: flex; flex-direction: column; gap: .25rem; margin-top: .25rem; max-height: 200px; overflow-y: auto; }

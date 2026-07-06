@@ -1,0 +1,28 @@
+services:
+  chatbot:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - chroma_data:/app/chroma_db
+      - ./pdfs:/app/pdfs        # mount local pdfs/ so reloads pick up new files
+      - ./config:/app/config    # mount config so schema syncs persist on host
+    depends_on:
+      - mongo
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:8
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_NAME:-chatbot}
+    restart: unless-stopped
+
+volumes:
+  chroma_data:
+  mongo_data:
