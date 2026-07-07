@@ -1,8 +1,6 @@
 {
-    "tstock_movement": "tstock_movement",
-    "tuser_stock": "tuser_stock",
     "daily_primary_vol": "daily_primary_vol",
     "daily_secondary_vol": "daily_secondary_vol",
-    "orders": "orders",
-    "distributor": "distributor"
+    "dbr_master": "dbr_master",
+    "territory_master": "territory_master"
 }

@@ -1,31 +1,38 @@
 {
   "relationships": [
     {
-      "left_table": "tstock_movement",
-      "right_table": "tuser_stock",
-      "left_key": "imei",
-      "right_key": "imei1",
-      "join_type": "LEFT"
-    },
-    {
       "left_table": "daily_primary_vol",
-      "right_table": "distributor",
+      "right_table": "dbr_master",
       "left_key": "dbr_code",
-      "right_key": "distributor_code",
+      "right_key": "dbr_code",
       "join_type": "LEFT"
     },
     {
       "left_table": "daily_secondary_vol",
-      "right_table": "distributor",
+      "right_table": "dbr_master",
       "left_key": "dbr_code",
-      "right_key": "distributor_code",
+      "right_key": "dbr_code",
       "join_type": "LEFT"
     },
     {
-      "left_table": "tstock_movement",
-      "right_table": "distributor",
+      "left_table": "daily_primary_vol",
+      "right_table": "territory_master",
+      "left_key": "ter_code",
+      "right_key": "territory_code",
+      "join_type": "LEFT"
+    },
+    {
+      "left_table": "daily_secondary_vol",
+      "right_table": "territory_master",
+      "left_key": "ter_code",
+      "right_key": "territory_code",
+      "join_type": "LEFT"
+    },
+    {
+      "left_table": "dbr_master",
+      "right_table": "territory_master",
       "left_key": "dbr_code",
-      "right_key": "distributor_code",
+      "right_key": "dbr_code",
       "join_type": "LEFT"
     }
   ]

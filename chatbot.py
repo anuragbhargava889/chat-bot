@@ -179,6 +179,15 @@ Rules:
 4. Rankings : ORDER BY … LIMIT N (SQL) | $sort + $limit (Mongo).
    Summaries: GROUP BY + aggregates (SQL) | $group (Mongo).
 5. Multi-table: use explicit JOINs for SQL; $lookup for MongoDB.
+5b. Filtering a large collection by an attribute that only lives in a smaller lookup/master
+   collection (e.g. filtering daily_primary_vol/daily_secondary_vol by a distributor's city,
+   which only exists on dbr_master): do NOT $lookup+$unwind the large collection and filter
+   after the join — that scans every row of the large collection. Instead resolve the small
+   collection FIRST to get the matching key list (e.g. query dbr_master for city=X, collect
+   dbr_code values), then filter the large collection directly with {{"dbr_code":{{"$in":[...]}}}}.
+   If the identifiers were already retrieved earlier in this conversation (e.g. the user says
+   "those distributors" / "these codes" referring to a prior answer), reuse those exact
+   identifiers instead of re-querying the master collection.
 6. For PDF questions use search_pdf_library and cite the source.
 7. For charts: call the query tool first, then generate_chart with the results.
 8. Always use {CURRENCY_SYMBOL} for all monetary values.

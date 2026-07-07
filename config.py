@@ -86,19 +86,35 @@ def get_db_tables(db_name: str) -> dict:
     return {}
 
 
-def _apply_descriptions(col_str: str, descriptions: dict[str, str]) -> str:
+def _format_description(desc) -> str:
+    """Render a column description (plain string or structured dict) as inline text."""
+    if isinstance(desc, dict):
+        parts = [str(desc.get("description", "")).strip()]
+        values = desc.get("values")
+        if isinstance(values, dict):
+            parts.append("values: " + "; ".join(f"{k}={v}" for k, v in values.items()))
+        return " — ".join(p for p in parts if p)
+    return str(desc)
+
+
+def _apply_descriptions(col_str: str, descriptions: dict) -> str:
     """Overlay {field: description} onto a column string.
 
-    Fields present in descriptions that don't already have a '(' annotation
-    get '(description)' appended. All other fields are left unchanged.
+    Fields whose description is "ignore" (case-insensitive) are dropped
+    entirely, so the LLM never sees them and can't use them in any query.
+    Remaining fields present in descriptions that don't already have a '('
+    annotation get '(description)' appended. All other fields are unchanged.
     """
     if not descriptions or not isinstance(descriptions, dict):
         return col_str
     entries = _parse_col_entries(col_str)
     result = []
     for name, entry in entries.items():
-        if name in descriptions and "(" not in entry:
-            result.append(f"{name}({descriptions[name]})")
+        desc = descriptions.get(name)
+        if isinstance(desc, str) and desc.strip().lower() == "ignore":
+            continue
+        if desc is not None and "(" not in entry:
+            result.append(f"{name}({_format_description(desc)})")
         else:
             result.append(entry)
     return ", ".join(result)
