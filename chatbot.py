@@ -13,9 +13,11 @@ Tool naming convention (auto-generated per databases.json):
 """
 from __future__ import annotations
 
+import decimal
 import json
 import logging
 import re
+from collections import Counter
 from datetime import datetime, timezone
 
 from langchain_community.utilities import SQLDatabase
@@ -371,6 +373,57 @@ def _convert_extended_json(obj):
     return obj
 
 
+_CATEGORICAL_MAX_DISTINCT = 20  # above this, only the distinct count is reported
+
+
+def _summarize_docs(docs: list, grouped: bool = False) -> dict:
+    """Collapse matched rows/documents into an aggregate summary — no raw records.
+
+    Shared by both the MongoDB and SQL query tools. Individual field values
+    (names, IDs, etc.) never reach the LLM this way; only counts and
+    numeric/categorical aggregates do.
+
+    `grouped` must be True only when the query itself already rolled the data
+    up (Mongo $group stage / SQL GROUP BY) — in that case categorical field
+    values are aggregate keys (e.g. product names from a group-by), safe to
+    list. When False (plain filter/sort/limit, no rollup), categorical field
+    values are raw per-row data (e.g. a customer_name column) — listing them
+    would leak row-level records piecemeal even though each field is
+    summarized on its own, so only the distinct count is reported, never the
+    values themselves.
+    """
+    if not docs:
+        return {"count": 0}
+
+    field_values: dict[str, list] = {}
+    for doc in docs:
+        for key, value in doc.items():
+            field_values.setdefault(key, []).append(value)
+
+    fields = {}
+    for field, values in field_values.items():
+        non_null = [v for v in values if v is not None]
+        if not non_null:
+            continue
+        if all(isinstance(v, (int, float, decimal.Decimal)) and not isinstance(v, bool) for v in non_null):
+            fields[field] = {
+                "type": "numeric",
+                "sum": sum(non_null),
+                "avg": sum(non_null) / len(non_null),
+                "min": min(non_null),
+                "max": max(non_null),
+            }
+        else:
+            str_values = [str(v) for v in non_null]
+            distinct = set(str_values)
+            entry = {"type": "categorical", "distinct_count": len(distinct)}
+            if grouped and len(distinct) <= _CATEGORICAL_MAX_DISTINCT:
+                entry["value_counts"] = dict(Counter(str_values).most_common())
+            fields[field] = entry
+
+    return {"count": len(docs), "fields": fields}
+
+
 # ── Tool factory ───────────────────────────────────────────────────────────────
 
 def _make_tools(user: dict | None) -> list:
@@ -399,7 +452,14 @@ def _make_tools(user: dict | None) -> list:
                     f"Tables: {tables_str_}. "
                     "Always include LIMIT. SELECT/WITH only. "
                     "If the result is empty, report 'No data found' immediately. "
-                    "Args: query — a valid SQL SELECT or WITH statement."
+                    "Args: query — a valid SQL SELECT or WITH statement. "
+                    "Result is NOT the raw matched rows — it is an aggregate summary: "
+                    "row count, plus per-column sum/avg/min/max for numeric columns and "
+                    "distinct value counts for text columns (each column summarized "
+                    "independently — values are not correlated row-by-row). Use GROUP BY "
+                    "in the query for named breakdowns (e.g. per product, per day) — "
+                    "GROUP BY key values are reported since they are aggregate labels, "
+                    "not raw row data."
                 ))
                 def sql_query(query: str) -> str:
                     stripped = query.strip()
@@ -410,13 +470,11 @@ def _make_tools(user: dict | None) -> list:
                         logger.info("query_%s: appended LIMIT 200", name_)
                     logger.info("query_%s: %s", name_, bounded[:200])
                     try:
-                        result = db_.run(bounded)
-                        if len(result) > _SQL_MAX_CHARS:
-                            logger.warning("query_%s result truncated (%d chars)", name_, len(result))
-                            result = (
-                                result[:_SQL_MAX_CHARS]
-                                + f"\n\n[Result truncated. Add a tighter LIMIT or date filter.]"
-                            )
+                        rows    = db_._execute(bounded, fetch="all")
+                        grouped = "GROUP BY" in bounded.upper()
+                        summary = _summarize_docs(rows, grouped=grouped)
+                        result  = json.dumps(summary, default=str)
+                        logger.info("query_%s: %d row(s) matched, returned as summary", name_, len(rows))
                         return result
                     except Exception as exc:
                         logger.warning("query_%s failed: %s", name_, exc)
@@ -456,7 +514,13 @@ def _make_tools(user: dict | None) -> list:
                     f"Collections: {', '.join(collections_.values()) or '(none configured)'}. "
                     "Args: collection — collection name; "
                     "pipeline — JSON array e.g. [{\"$match\":{\"k\":\"v\"}},{\"$limit\":50}]. "
-                    "Always include a $limit stage. No $out or $merge."
+                    "Always include a $limit stage. No $out or $merge. "
+                    "Result is NOT the raw matched documents — it is an aggregate summary: "
+                    "document count, plus per-field sum/avg/min/max for numeric fields and "
+                    "distinct value counts for categorical fields (each field summarized "
+                    "independently — values are not correlated row-by-row, so e.g. you get "
+                    "the list of distinct product names AND separately the sum/avg of a "
+                    "quantity field, not which product had which quantity)."
                 ))
                 def mongo_query(collection: str, pipeline: str = "[]") -> str:
                     if collection not in allowed_:
@@ -478,13 +542,12 @@ def _make_tools(user: dict | None) -> list:
                     try:
                         from db.factory import build_mongo_client
                         logger.info("query_%s on %s — pipeline: %s", name_, collection, pipeline[:600])
-                        client = build_mongo_client(cfg_)
-                        docs   = list(client[mdb_name_][collection].aggregate(pipe))
-                        result = json.dumps(docs, default=str)
-                        if len(result) > _SQL_MAX_CHARS:
-                            logger.warning("query_%s result truncated (%d chars)", name_, len(result))
-                            result = result[:_SQL_MAX_CHARS] + "\n\n[Result truncated.]"
-                        logger.info("query_%s: %d doc(s) returned from %s", name_, len(docs), collection)
+                        client  = build_mongo_client(cfg_)
+                        docs    = list(client[mdb_name_][collection].aggregate(pipe))
+                        grouped = any("$group" in stage for stage in pipe)
+                        summary = _summarize_docs(docs, grouped=grouped)
+                        result  = json.dumps(summary, default=str)
+                        logger.info("query_%s: %d doc(s) matched in %s, returned as summary", name_, len(docs), collection)
                         return result
                     except Exception as exc:
                         logger.warning("query_%s failed: %s", name_, exc)
